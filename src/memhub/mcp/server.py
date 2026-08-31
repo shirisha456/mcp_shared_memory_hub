@@ -11,9 +11,8 @@ store credentials; state a rejected alternative inside the decision rather than
 as a standalone fact. Those sentences are load-bearing for correctness, and the
 golden-manifest protocol test fails if they change by accident.
 
-Milestone 1 exposes three tools. ``memory_revise``, ``memory_forget``,
-``memory_context`` and ``memory_history`` arrive with the milestones that give
-them something to do.
+Milestone 2 exposes four tools. ``memory_forget``, ``memory_context`` and
+``memory_history`` arrive with the milestones that give them something to do.
 """
 
 # NOTE: no ``from __future__ import annotations`` in this module, deliberately.
@@ -33,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from memhub.domain.enums import AuthorKind, MemoryType
 from memhub.domain.errors import ValidationFailedError
 from memhub.mcp.mapping import domain_errors
-from memhub.mcp.schemas import MemoryOut, ProjectOut, RememberOut, SearchOut
+from memhub.mcp.schemas import MemoryOut, ProjectOut, RememberOut, ReviseOut, SearchOut
 from memhub.persistence.engine import session_scope
 from memhub.services import memories as memory_service
 from memhub.services import projects as project_service
@@ -198,6 +197,16 @@ def build_server(
             bool,
             Field(description="True if the user explicitly asked for this to be remembered."),
         ] = False,
+        client_request_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Unique per logical request, 8-128 characters; a UUID is ideal. "
+                    "Retrying with the same value returns the original result "
+                    "instead of storing a second copy."
+                )
+            ),
+        ] = None,
     ) -> RememberOut:
         async with session_scope(session_factory) as session:
             result = await memory_service.remember(
@@ -210,8 +219,68 @@ def build_server(
                 source=source,
                 author_client=client,
                 author_kind=(AuthorKind.HUMAN_CONFIRMED if human_confirmed else AuthorKind.AGENT),
+                client_request_id=client_request_id,
             )
             return RememberOut.of(result)
+
+    @server.tool(
+        name="memory_revise",
+        title="Update an existing memory",
+        description=(
+            "Change the content of a memory you have already read.\n\n"
+            "You must pass expected_revision - the revision_no you saw when you "
+            "read it. If another client has changed the memory since then, your "
+            "write is refused and you get back their version instead, with the "
+            "revision number to retry with. This is not an error: it means "
+            "someone else got there first and you would otherwise have silently "
+            "erased their change.\n\n"
+            "On a conflict, read the returned content, merge your change into it, "
+            "and call again with the new expected_revision. Do not simply resend "
+            "your original text.\n\n"
+            "Use this to refine a fact that is still the same fact. If the fact "
+            "has been replaced by a different one, that is supersession, not "
+            "revision - support for it arrives in a later version.\n\n"
+            "Pass client_request_id (any unique string, a UUID is ideal) so that "
+            "retrying after a dropped connection replays the original result "
+            "rather than reporting a confusing conflict against yourself."
+        ),
+    )
+    @domain_errors
+    async def memory_revise(
+        project_id: Annotated[str, Field(description="From project_use.")],
+        memory_id: Annotated[str, Field(description="The memory to change.")],
+        expected_revision: Annotated[
+            int,
+            Field(
+                description="The revision_no you read. The write fails if it has moved on.", ge=1
+            ),
+        ],
+        content: Annotated[str, Field(description="The full new content, not a diff.")],
+        tags: Annotated[
+            list[str] | None, Field(description="Replaces the existing tags entirely.")
+        ] = None,
+        change_reason: Annotated[
+            str | None, Field(description="Why this changed, e.g. 'clarified after review'.")
+        ] = None,
+        client: Annotated[str, Field(description="Your client name.")] = "unknown",
+        client_request_id: Annotated[
+            str | None,
+            Field(description="Unique per logical request, 8-128 chars. Makes retries safe."),
+        ] = None,
+    ) -> ReviseOut:
+        async with session_scope(session_factory) as session:
+            result = await memory_service.revise(
+                session,
+                _parse_uuid(project_id, "project_id"),
+                _parse_uuid(memory_id, "memory_id"),
+                expected_revision=expected_revision,
+                content=content,
+                tags=tags,
+                change_reason=change_reason,
+                author_client=client,
+                client_request_id=client_request_id,
+            )
+            return ReviseOut.of(result)
 
     @server.tool(
         name="memory_search",

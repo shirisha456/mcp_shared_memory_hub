@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     ForeignKey,
@@ -40,7 +42,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, TIMESTAMP, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from memhub.persistence.base import Base
@@ -241,4 +243,98 @@ class MemoryRevision(Base):
             postgresql_where=text("is_current"),
         ),
         Index("ix_memory_revisions_project_id", "project_id"),
+    )
+
+
+class IdempotencyKey(Base):
+    """Makes a retried write safe.
+
+    The protocol is in ``memhub.services.idempotency``; what matters here is that
+    the primary key is the whole mechanism. "Check whether the key exists, then
+    insert" races - two retries can both pass the check. ``INSERT ... ON CONFLICT
+    DO NOTHING`` against this key is a single atomic statement, so exactly one
+    caller can ever claim it.
+
+    ``request_fingerprint`` guards the other half: a key reused with a *different*
+    payload must fail loudly rather than silently return the earlier result,
+    which would answer a question the caller never asked.
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    client_request_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    operation: Mapped[str] = mapped_column(Text, nullable=False)
+    request_fingerprint: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    completed_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    expires_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("now() + interval '7 days'"),
+    )
+
+    __table_args__ = (
+        CheckConstraint("state IN ('IN_PROGRESS','COMPLETED')", name="state_known"),
+        CheckConstraint("length(client_request_id) BETWEEN 8 AND 128", name="request_id_length"),
+        # A completed claim without a stored response cannot be replayed, which
+        # would silently turn a retry into a second write.
+        CheckConstraint(
+            "state <> 'COMPLETED' OR response IS NOT NULL", name="completed_has_response"
+        ),
+        # Supports the bounded GC sweep. Unbounded DELETE on a busy table is its
+        # own outage, so the sweep is always LIMITed and needs this index.
+        Index("ix_idempotency_keys_expires_at", "expires_at"),
+    )
+
+
+class AuditEvent(Base):
+    """A durable record of what happened to a memory, and who did it.
+
+    Distinct from the application log, and deliberately so. Application logs are
+    operational and rotate away; this is part of the product - it is what
+    ``memory_history`` will use to answer "who created this and what happened to
+    it". Conflating the two means the audit trail disappears with log retention.
+
+    Never contains memory content. Only identifiers, outcomes and sizes, so that
+    the log can be read freely without exposing what the memories say.
+    """
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    memory_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    revision_no: Mapped[int | None] = mapped_column(Integer)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_client: Mapped[str] = mapped_column(Text, nullable=False)
+    request_id: Mapped[str | None] = mapped_column(Text)
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('remember','revise','forget','supersede','purge')",
+            name="action_known",
+        ),
+        CheckConstraint(
+            "outcome IN ('ok','conflict','dedup','replay','rejected')", name="outcome_known"
+        ),
+        # No foreign key to memories, on purpose: an audit row must survive the
+        # thing it describes. An operator purge destroys a memory and every
+        # revision of it, and the record that the purge happened has to outlive
+        # that. A CASCADE here would erase the evidence along with the subject.
+        Index("ix_audit_events_memory_id_at", "memory_id", text("at DESC")),
+        Index("ix_audit_events_project_id_at", "project_id", text("at DESC")),
     )

@@ -47,12 +47,14 @@ class MemoryView:
     updated_at: dt.datetime
 
 
-RememberOutcome = Literal["created"]
-"""Milestone 3 adds "deduplicated"; Milestone 2 adds "idempotent_replay".
+RememberOutcome = Literal["created", "idempotent_replay"]
+"""Milestone 3 adds "deduplicated".
 
-Modelled as a discriminator from the start because domain outcomes are returned
-as ordinary structured results, not as errors - the model needs machine-readable
-data to branch on, not a sentence to parse.
+A discriminator rather than an error, because domain outcomes are returned as
+ordinary structured results - the model needs machine-readable data to branch
+on, not a sentence to parse. ``idempotent_replay`` means "your retry did not
+create anything, because your first attempt already landed"; the memory returned
+is the one that first attempt created.
 """
 
 
@@ -60,6 +62,49 @@ data to branch on, not a sentence to parse.
 class RememberResult:
     memory: MemoryView
     outcome: RememberOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseSucceeded:
+    """This caller won the compare-and-set."""
+
+    memory: MemoryView
+    previous_revision: int
+    outcome: Literal["revised"] = "revised"
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseReplayed:
+    """This caller retried a request that had already been applied."""
+
+    memory: MemoryView
+    outcome: Literal["idempotent_replay"] = "idempotent_replay"
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseConflicted:
+    """Another writer got there first.
+
+    Not an error. The request was well formed and the database evaluated it
+    correctly; the answer is simply "no, and here is why". Everything needed to
+    merge and retry in a single round trip is carried here: the current revision
+    number, its content, and who changed it.
+    """
+
+    current: MemoryView
+    expected_revision: int
+    outcome: Literal["conflict"] = "conflict"
+
+
+ReviseResult = ReviseSucceeded | ReviseReplayed | ReviseConflicted
+"""A union rather than one nullable-everything struct.
+
+Internally this means the type checker forces every caller to handle the
+conflict branch - it is impossible to read ``.memory`` off a conflict by
+accident. The MCP layer flattens it into a single output schema, because a
+JSON-Schema ``anyOf`` is harder for a model to consume than one object with an
+``outcome`` field.
+"""
 
 
 @dataclass(frozen=True, slots=True)

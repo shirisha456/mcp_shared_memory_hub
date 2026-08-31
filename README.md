@@ -4,8 +4,8 @@ A persistent, versioned memory service that lets multiple MCP-compatible AI clie
 knowledge across sessions, with conflict-safe updates, provenance, hybrid retrieval, stale-memory
 handling, and context-budgeted recall.
 
-**Status: Milestone 1 — memory persistence + MCP slice.** Three MCP tools over stdio,
-backed by PostgreSQL. See
+**Status: correctness core.** Four MCP tools over stdio, backed by PostgreSQL, with
+compare-and-set updates and idempotent writes. See
 [`docs/architecture.md`](docs/architecture.md) for the full design and
 [the roadmap](docs/architecture.md#15-revised-roadmap) for what lands when.
 
@@ -94,12 +94,13 @@ Each client spawns its **own** server process. They share nothing but PostgreSQL
 |---|---|
 | `project_use` | Resolve or explicitly create a project namespace. Never creates implicitly. |
 | `memory_remember` | Record one durable piece of project knowledge. |
+| `memory_revise` | Update a memory, guarded by `expected_revision`. A conflict returns the winning version, not an error. |
 | `memory_search` | Retrieve active memories. Superseded, deleted and expired are never returned. |
 
 Plus one read-only resource, `memory://memories/{memory_id}`.
 
-`memory_revise`, `memory_forget`, `memory_history` and `memory_context` arrive with the milestones
-that give them something to do.
+`memory_forget`, `memory_history` and `memory_context` arrive with the milestones that give them
+something to do.
 
 ## Milestone status
 
@@ -107,8 +108,8 @@ that give them something to do.
 |---|---|---|
 | 0 | Skeleton: Docker, Alembic, logging, test harness, CI | done |
 | 1 | Projects, memories, immutable revisions, 3 MCP tools over stdio | done |
-| 2 | Compare-and-set revise, idempotency, audit log, metrics | next |
-| 3 | Deduplication, attestations, supersession, forget, history | |
+| 2 | Compare-and-set revise, idempotency, audit log, metrics | done |
+| 3 | Deduplication, attestations, supersession, forget, history | next |
 | 4 | Claude Desktop / Cursor integration, golden manifest | |
 | 5 | Full-text retrieval | |
 | 6 | Evaluation harness (before vectors, deliberately) | |
@@ -116,20 +117,56 @@ that give them something to do.
 | 8 | Context builder under a token budget | |
 | 9 | Failure injection, benchmarks, `EXPLAIN ANALYZE` | |
 
-### What Milestone 1 deliberately does not do
+### Concurrency
 
-Revision, supersession, deduplication and idempotency are **schema-ready but not implemented**.
-`memories` carries `superseded_by_id` and `current_revision_no`; `memory_revisions` is append-only
-with a partial unique index enforcing one current revision. Those constraints exist now because
-splitting a table definition across three migrations is worse engineering than writing it once —
-but nothing exercises them yet.
+Each MCP client runs its own server process. They share no memory, so PostgreSQL is the only thing
+that can adjudicate a conflicting write. `memory_revise` performs a single-statement compare-and-set
+at `READ COMMITTED`:
 
-`content_hash` is computed on every write despite deduplication being Milestone 3, because the
-column is `NOT NULL` on an append-only table and backfilling it later would need a data migration.
+```sql
+UPDATE memories SET current_revision_no = current_revision_no + 1
+ WHERE id = :id AND project_id = :pid AND current_revision_no = :expected AND status = 'ACTIVE'
+```
+
+Zero rows means another writer got there first. The correctness argument is `EvalPlanQual`: when the
+losing transaction unblocks, PostgreSQL walks to the newest committed row version and re-evaluates
+this `WHERE` against it, so the read and the write are the same statement and there is no window to
+lose. `READ COMMITTED` is chosen *for* these semantics — `SERIALIZABLE` would raise `40001` and turn
+49 clean refusals into 49 retries.
+
+`tests/concurrency/` proves it: 50 writers aligned on a barrier, exactly 1 success and 49 conflicts,
+then the invariant suite. The fixture asserts the pool can supply 50 distinct backends first,
+because a 50-way test against a 10-connection pool measures five sequential waves and passes for the
+wrong reason. Removing the version predicate from the SQL makes those tests fail — verified.
+
+### Idempotency is not deduplication
+
+Idempotency is *one* client retrying *the same request*, keyed on a caller-supplied
+`client_request_id`; the retry replays the original response. Deduplication is *two* clients
+asserting *the same fact*, keyed on a content hash; that arrives next.
+
+The claim is `INSERT ... ON CONFLICT DO NOTHING` — "check then insert" races. If another transaction
+holds the key uncommitted, `SELECT ... FOR SHARE` blocks until it resolves: a row means it committed
+and its response is replayed, no row means it rolled back and the key is free. A key reused with a
+*different* payload is refused rather than silently answering a question the caller never asked.
+
+Note that `memory_revise` does not *need* a key for correctness — the compare-and-set already makes
+a duplicate write impossible. The key is there so a retry after a dropped connection replays cleanly
+instead of reporting a conflict against yourself.
+
+### What is deliberately not built yet
+
+Supersession and deduplication are **schema-ready but not implemented**: `memories` carries
+`superseded_by_id`, and `content_hash` is computed on every write because the column is `NOT NULL`
+on an append-only table and backfilling it later would need a data migration.
 
 Search is substring matching with a deterministic total order. No relevance ranking, because
 Milestone 6 builds the evaluation harness that can prove ranking is an improvement — and building
 the measurement after the optimisation means fitting the metric to the conclusion.
+
+Metrics are an in-process registry that enforces the label-cardinality rule (`memory_id` and
+`project_id` are refused as labels). There is no OTLP exporter: the server is a short-lived
+subprocess, so pull-based scraping cannot find it and push needs a collector. That is Milestone 9.
 
 ## Layout
 

@@ -13,12 +13,13 @@ import datetime as dt
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memhub.domain.enums import AuthorKind, MemoryStatus, MemoryType
 from memhub.domain.models import MemoryView
 from memhub.persistence.models import Memory, MemoryRevision
+from memhub.persistence.sql import CAS_REVISE, load
 from memhub.retrieval.filters import current_revisions
 
 
@@ -164,3 +165,78 @@ class MemoryRepository:
             limit
         )
         return [(row[0], row[1]) for row in (await self._session.execute(stmt)).all()]
+
+    async def compare_and_set(
+        self,
+        project_id: uuid.UUID,
+        memory_id: uuid.UUID,
+        *,
+        expected_revision: int,
+        content: str,
+        content_hash: bytes,
+        hash_version: int,
+        tags: Sequence[str],
+        change_reason: str | None,
+        author_client: str,
+        author_kind: AuthorKind,
+        source: str | None,
+    ) -> int | None:
+        """Advance a memory to its next revision, or report that we lost.
+
+        Returns the new revision number on success, ``None`` on conflict.
+
+        Three statements, in this order, and the order is load-bearing:
+
+        1. The CAS ``UPDATE`` on ``memories``. This is both the serialisation
+           point and the predicate check - it takes the row lock and evaluates
+           the expected revision atomically. Zero rows means another writer got
+           there first. See ``persistence/sql/cas_revise.sql`` for why that is
+           correct at the storage-engine level.
+        2. Demote the outgoing revision.
+        3. Append the new one.
+
+        Taking the ``memories`` row lock *first*, in every write path, is what
+        makes this deadlock-free: all writers acquire locks in the same order,
+        so no cycle can form.
+        """
+        new_revision = (
+            await self._session.execute(
+                load(CAS_REVISE),
+                {
+                    "memory_id": memory_id,
+                    "project_id": project_id,
+                    "expected_revision": expected_revision,
+                },
+            )
+        ).scalar_one_or_none()
+
+        if new_revision is None:
+            return None
+
+        await self._session.execute(
+            update(MemoryRevision)
+            .where(
+                MemoryRevision.memory_id == memory_id,
+                MemoryRevision.revision_no == expected_revision,
+            )
+            .values(is_current=False)
+        )
+
+        self._session.add(
+            MemoryRevision(
+                memory_id=memory_id,
+                project_id=project_id,
+                revision_no=int(new_revision),
+                content=content,
+                content_hash=content_hash,
+                hash_version=hash_version,
+                tags=list(tags),
+                is_current=True,
+                change_reason=change_reason,
+                source=source,
+                author_client=author_client,
+                author_kind=author_kind.value,
+            )
+        )
+        await self._session.flush()
+        return int(new_revision)

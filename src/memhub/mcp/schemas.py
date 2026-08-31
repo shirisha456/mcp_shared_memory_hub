@@ -14,7 +14,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from memhub.domain.models import MemoryView, ProjectRef, RememberResult, SearchResult
+from memhub.domain.models import (
+    MemoryView,
+    ProjectRef,
+    RememberResult,
+    ReviseReplayed,
+    ReviseResult,
+    ReviseSucceeded,
+    SearchResult,
+)
 
 
 class ProjectOut(BaseModel):
@@ -72,11 +80,12 @@ class MemoryOut(BaseModel):
 
 
 class RememberOut(BaseModel):
-    outcome: Literal["created"] = Field(
+    outcome: Literal["created", "idempotent_replay"] = Field(
         description=(
-            "Discriminator for how the write resolved. Later milestones add "
-            "'deduplicated' and 'idempotent_replay'; branch on this rather than "
-            "assuming a memory was newly created."
+            "How the write resolved. 'created': a new memory was stored. "
+            "'idempotent_replay': this exact request had already been applied, so "
+            "nothing new was written and the original memory is returned. Branch "
+            "on this rather than assuming a memory was newly created."
         )
     )
     memory: MemoryOut
@@ -106,4 +115,65 @@ class SearchOut(BaseModel):
             results=[MemoryOut.of(view) for view in result.memories],
             returned=len(result.memories),
             total_matched=result.total_considered,
+        )
+
+
+class ReviseOut(BaseModel):
+    """One flat shape for all three revise outcomes.
+
+    The domain models these as a union, which forces internal callers to handle
+    the conflict branch. Here it is flattened, because a JSON-Schema ``anyOf`` is
+    harder for a model to consume than a single object with an ``outcome`` field
+    it can branch on.
+
+    On a conflict, ``memory`` holds the revision that *won*, not the one the
+    caller tried to write - so a single round trip carries everything needed to
+    merge and retry.
+    """
+
+    outcome: Literal["revised", "conflict", "idempotent_replay"] = Field(
+        description=(
+            "'revised': your change was applied. 'conflict': another client "
+            "changed this memory first - 'memory' below is the current state and "
+            "'current_revision' is the number to retry with. 'idempotent_replay': "
+            "this request had already been applied; nothing new was written."
+        )
+    )
+    memory: MemoryOut
+    previous_revision: int | None = Field(
+        default=None, description="On success, the revision this replaced."
+    )
+    current_revision: int | None = Field(
+        default=None,
+        description="On conflict, the revision that won. Retry with this value.",
+    )
+    expected_revision: int | None = Field(
+        default=None, description="On conflict, the revision you sent."
+    )
+    guidance: str | None = Field(default=None, description="On conflict, what to do next.")
+
+    @classmethod
+    def of(cls, result: ReviseResult) -> ReviseOut:
+        if isinstance(result, ReviseSucceeded):
+            return cls(
+                outcome="revised",
+                memory=MemoryOut.of(result.memory),
+                previous_revision=result.previous_revision,
+            )
+        if isinstance(result, ReviseReplayed):
+            return cls(outcome="idempotent_replay", memory=MemoryOut.of(result.memory))
+        return cls(
+            outcome="conflict",
+            memory=MemoryOut.of(result.current),
+            current_revision=result.current.revision_no,
+            expected_revision=result.expected_revision,
+            guidance=(
+                f"Another client changed this memory to revision "
+                f"{result.current.revision_no} (by "
+                f"{result.current.author_client}) while you held revision "
+                f"{result.expected_revision}. Read the content above, merge your "
+                f"change into it, and call memory_revise again with "
+                f"expected_revision={result.current.revision_no}. Do not simply "
+                "resend your original text: that would discard their change."
+            ),
         )

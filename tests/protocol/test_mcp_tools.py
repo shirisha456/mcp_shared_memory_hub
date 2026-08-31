@@ -33,7 +33,7 @@ from memhub.persistence.engine import create_session_factory
 
 pytestmark = pytest.mark.integration
 
-EXPECTED_TOOLS = {"project_use", "memory_remember", "memory_search"}
+EXPECTED_TOOLS = {"project_use", "memory_remember", "memory_revise", "memory_search"}
 
 
 @pytest.fixture
@@ -65,7 +65,7 @@ async def make_project(client: Client, slug: str) -> str:
 
 
 class TestManifest:
-    async def test_exposes_exactly_the_milestone_1_tools(self, server: MCPServer) -> None:
+    async def test_exposes_exactly_the_expected_tools(self, server: MCPServer) -> None:
         """A guard against accidental surface growth.
 
         The tool surface is meant to stay small and deliberate. A new tool
@@ -116,6 +116,14 @@ class TestManifest:
         project_use = next(t for t in listed.tools if t.name == "project_use")
         assert project_use.description is not None
         assert "never created implicitly" in project_use.description
+
+        # A conflict is a normal outcome, and the description has to say so.
+        # A model told only "your write failed" retries blindly; one told
+        # "someone changed it, here is their version" merges.
+        revise = next(t for t in listed.tools if t.name == "memory_revise")
+        assert revise.description is not None
+        assert "This is not an error" in revise.description
+        assert "Do not simply resend" in revise.description
 
     async def test_server_instructions_do_not_overclaim(self, server: MCPServer) -> None:
         """The accuracy constraint, asserted rather than trusted.
@@ -336,3 +344,135 @@ class TestResources:
         body = json.loads(contents.text)
         assert body["content"] == "No Redis in V1."
         assert body["memory_id"] == memory_id
+
+
+class TestReviseOverTheProtocol:
+    async def test_conflict_is_a_result_not_an_error(self, server: MCPServer) -> None:
+        """The architecture 3.4(a) amendment, exercised end to end.
+
+        A conflict reaches the model as an ordinary structured result with
+        outcome='conflict'. Not is_error, because the request was well formed and
+        the domain simply said no - and the model needs machine-readable data to
+        branch on, not a sentence to parse.
+        """
+        async with Client(server) as client:
+            pid = await make_project(client, "revise-conflict")
+            written = ok(
+                await client.call_tool(
+                    "memory_remember",
+                    {"project_id": pid, "type": "DECISION", "content": "Redis is the queue."},
+                )
+            )
+            memory_id = written["memory"]["memory_id"]
+
+            first = ok(
+                await client.call_tool(
+                    "memory_revise",
+                    {
+                        "project_id": pid,
+                        "memory_id": memory_id,
+                        "expected_revision": 1,
+                        "content": "PostgreSQL is the queue.",
+                        "client": "cursor",
+                    },
+                )
+            )
+            # A second client still holding revision 1.
+            stale = await client.call_tool(
+                "memory_revise",
+                {
+                    "project_id": pid,
+                    "memory_id": memory_id,
+                    "expected_revision": 1,
+                    "content": "SQLite is the queue.",
+                    "client": "claude-desktop",
+                },
+            )
+
+        assert first["outcome"] == "revised"
+        assert first["memory"]["revision_no"] == 2
+
+        assert stale.is_error is False, "a conflict is an outcome, not a tool error"
+        assert stale.structured_content is not None
+        payload = dict(stale.structured_content)
+        assert payload["outcome"] == "conflict"
+        assert payload["expected_revision"] == 1
+        assert payload["current_revision"] == 2
+        # Everything needed to merge and retry, in one round trip.
+        assert payload["memory"]["content"] == "PostgreSQL is the queue."
+        assert payload["memory"]["author_client"] == "cursor"
+        assert "expected_revision=2" in payload["guidance"]
+
+    async def test_search_returns_only_the_current_revision(self, server: MCPServer) -> None:
+        """Superseded revisions stay in the log but leave retrieval."""
+        async with Client(server) as client:
+            pid = await make_project(client, "revise-search")
+            written = ok(
+                await client.call_tool(
+                    "memory_remember",
+                    {"project_id": pid, "type": "DECISION", "content": "Redis is the queue."},
+                )
+            )
+            await client.call_tool(
+                "memory_revise",
+                {
+                    "project_id": pid,
+                    "memory_id": written["memory"]["memory_id"],
+                    "expected_revision": 1,
+                    "content": "PostgreSQL is the queue.",
+                },
+            )
+            found = ok(await client.call_tool("memory_search", {"project_id": pid}))
+
+        assert found["returned"] == 1
+        assert found["results"][0]["content"] == "PostgreSQL is the queue."
+        assert found["results"][0]["revision_no"] == 2
+
+    async def test_retry_with_an_idempotency_key_replays(self, server: MCPServer) -> None:
+        """A dropped connection must not cost the caller a duplicate memory."""
+        async with Client(server) as client:
+            pid = await make_project(client, "revise-idempotent")
+            key = "protocol-test-key-0001"
+            payload = {
+                "project_id": pid,
+                "type": "FACT",
+                "content": "Python 3.12 minimum.",
+                "client_request_id": key,
+            }
+            first = ok(await client.call_tool("memory_remember", payload))
+            retry = ok(await client.call_tool("memory_remember", payload))
+            found = ok(await client.call_tool("memory_search", {"project_id": pid}))
+
+        assert first["outcome"] == "created"
+        assert retry["outcome"] == "idempotent_replay"
+        assert retry["memory"]["memory_id"] == first["memory"]["memory_id"]
+        assert found["returned"] == 1, "the retry must not have created a second memory"
+
+    async def test_reusing_a_key_for_a_different_request_is_refused(
+        self, server: MCPServer
+    ) -> None:
+        async with Client(server) as client:
+            pid = await make_project(client, "revise-key-reuse")
+            key = "protocol-test-key-0002"
+            ok(
+                await client.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "FACT",
+                        "content": "the original",
+                        "client_request_id": key,
+                    },
+                )
+            )
+            result = await client.call_tool(
+                "memory_remember",
+                {
+                    "project_id": pid,
+                    "type": "FACT",
+                    "content": "something else entirely",
+                    "client_request_id": key,
+                },
+            )
+
+        assert "IDEMPOTENCY_KEY_REUSED" in error_text(result)

@@ -137,5 +137,6 @@ async def test_stdout_carries_only_protocol_traffic(database_url: str) -> None:
     assert {tool.name for tool in listed.tools} == {
         "project_use",
         "memory_remember",
+        "memory_revise",
         "memory_search",
     }
