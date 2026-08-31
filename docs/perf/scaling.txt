@@ -1,0 +1,11 @@
+Selective full-text search as the corpus grows.
+Server time is PostgreSQL's own execution time; client time includes
+Docker port forwarding on the development machine.
+
+  1,000 memories  matched=5      server=  0.36ms  client=  5.34ms
+ 10,000 memories  matched=50     server=  0.53ms  client= 11.00ms
+100,000 memories  matched=500    server=  0.67ms  client= 22.80ms
+
+Corpus grew 100x; query time grew 1.9x.
+Sub-linear growth is the property that matters: the work is proportional
+to the number of matches, not the size of the table.

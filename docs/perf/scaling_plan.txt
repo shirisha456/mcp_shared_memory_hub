@@ -1,0 +1,28 @@
+EXPLAIN ANALYZE at 100,000 memories, selective query, LIMIT 10.
+
+Recorded, not asserted on. Two earlier versions of this benchmark did
+assert that the GIN index appears in the plan, and both were wrong for
+the same reason: PostgreSQL keeps finding cheaper ways to answer the
+query than the one the test expected.
+
+Here it chooses a sequential scan even at 100,000 rows, and it is right
+to. With LIMIT 10 the scan stops as soon as it has ten matches - note
+'Rows Removed by Filter' in the plan below, a small fraction of the
+table - so index access plus heap fetches would cost more than simply
+reading until satisfied. The index earns its keep on queries that must
+examine every match, not on ones that stop early.
+
+What matters is in scaling.txt: cost grows with the answer, not the
+corpus. That is the property an index exists to provide, and it holds
+whichever access path the planner picks to provide it.
+
+Limit  (cost=0.42..252.77 rows=10 width=16) (actual time=0.082..0.814 rows=10 loops=1)
+  ->  Nested Loop  (cost=0.42..10675.12 rows=423 width=16) (actual time=0.080..0.809 rows=10 loops=1)
+        ->  Seq Scan on memory_revisions r  (cost=0.00..7757.00 rows=423 width=32) (actual time=0.059..0.713 rows=10 loops=1)
+              Filter: (is_current AND (content_tsv @@ '''quiescenc'''::tsquery) AND (project_id = 'bdd593c5-eefb-404a-bdc1-38f75af50997'::uuid))
+              Rows Removed by Filter: 1563
+        ->  Index Scan using pk_memories on memories m  (cost=0.42..6.90 rows=1 width=32) (actual time=0.008..0.008 rows=1 loops=10)
+              Index Cond: (id = r.memory_id)
+              Filter: ((project_id = 'bdd593c5-eefb-404a-bdc1-38f75af50997'::uuid) AND (status = 'ACTIVE'::text))
+Planning Time: 0.528 ms
+Execution Time: 0.850 ms

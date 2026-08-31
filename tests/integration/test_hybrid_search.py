@@ -25,6 +25,7 @@ from memhub.embeddings.base import EmbeddingError
 from memhub.embeddings.fake import HashEmbedder
 from memhub.embeddings.worker import EmbeddingWorker
 from memhub.persistence.engine import create_session_factory
+from memhub.persistence.sqlstate import QUERY_CANCELED
 from memhub.services.memories import remember
 from memhub.services.projects import use_project
 from memhub.services.retrieval import hybrid_search
@@ -157,6 +158,64 @@ class TestDegradation:
         assert found.returned_count() == 1
         assert found.degraded is not None
         assert "lexical_only" in found.degraded
+
+    async def test_a_semantic_leg_over_the_deadline_degrades_rather_than_fails(
+        self, sessions: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The expensive leg timing out must not take the whole search down.
+
+        The semantic leg is an HNSW probe over the project, so it is the one that
+        reaches ``statement_timeout`` first. The lexical results are already in
+        hand by then, and half an answer beats an error - provided the caller is
+        told which half they got.
+        """
+        from sqlalchemy.exc import DBAPIError
+
+        from memhub.retrieval import semantic
+
+        class CancelledError(Exception):
+            sqlstate = QUERY_CANCELED
+
+        async def times_out(*args: object, **kwargs: object) -> None:
+            raise DBAPIError("SELECT ...", {}, CancelledError("canceling statement"))
+
+        project = await seeded_project(
+            sessions, "hybrid-deadline", ["PostgreSQL is the task queue."]
+        )
+        monkeypatch.setattr(semantic, "search_by_vector", times_out)
+
+        async with sessions() as session:
+            found = await hybrid_search(session, project.id, query="queue", embedder=HashEmbedder())
+
+        assert found.returned_count() == 1
+        assert found.degraded is not None
+        assert "statement timeout" in found.degraded
+
+    async def test_an_unrelated_database_error_is_not_swallowed(
+        self, sessions: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a cancelled statement degrades.
+
+        Catching every ``DBAPIError`` here would turn a genuine bug in the vector
+        query - a bad cast, a missing column - into a search that silently
+        returns lexical results forever and reports itself as merely degraded.
+        """
+        from sqlalchemy.exc import DBAPIError
+
+        from memhub.retrieval import semantic
+
+        class BadColumnError(Exception):
+            sqlstate = "42703"
+
+        async def broken(*args: object, **kwargs: object) -> None:
+            raise DBAPIError("SELECT ...", {}, BadColumnError("no such column"))
+
+        project = await seeded_project(sessions, "hybrid-bug", ["PostgreSQL is the task queue."])
+        monkeypatch.setattr(semantic, "search_by_vector", broken)
+
+        async with sessions() as session:
+            with pytest.raises(DBAPIError):
+                await hybrid_search(session, project.id, query="queue", embedder=HashEmbedder())
 
 
 class TestSuppressionStillHolds:

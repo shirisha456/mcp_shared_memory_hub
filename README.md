@@ -140,7 +140,7 @@ one atomic act, so `memory_remember` takes a `supersedes` argument.
 | 6 | Evaluation harness (before vectors, deliberately) | done |
 | 7 | pgvector, embedding outbox, hybrid RRF ranking | done |
 | 8 | Context builder under a token budget | done |
-| 9 | Failure injection, benchmarks, `EXPLAIN ANALYZE` | next |
+| 9 | Failure injection, retention, operator CLI, scaling benchmarks | done |
 
 ### Concurrency
 
@@ -335,6 +335,88 @@ the retired memory at maximum importance and its replacement at minimum. It hold
 reason it held through full-text and through vectors: selection can only choose from candidates the
 stage-0 filter already excluded it from.
 
+### Failure is a specification, not an afterthought
+
+The architecture lists eighteen ways this system can fail and what it does about each.
+[`docs/failure-modes.md`](docs/failure-modes.md) maps every one of those rows to the test that holds
+it up — and says plainly which three are argued rather than tested, and why a test there would be
+testing PostgreSQL rather than this system.
+
+Writing that document found two things the prose had stopped being true about. Three error codes it
+promised did not exist anywhere in the code, so a database outage reached the model as an opaque
+internal error — which a model reads as *this tool is broken*, and then stops calling it. And the
+documented degradation path fired only when the embedder failed, not when a query was cancelled,
+which is the likelier cause. Both are fixed.
+
+Driver failures now arrive as codes that say what to do next, and the distinction between them is
+the point:
+
+| Code | Safe to retry | Because |
+|---|---|---|
+| `BACKEND_UNAVAILABLE` | yes | the connection never opened; nothing ran |
+| `BACKEND_BUSY` | yes | the pool timed out before a statement was sent |
+| `UNKNOWN_OUTCOME` | **no** | the connection died mid-flight; the write may have committed |
+| `DEADLINE_EXCEEDED` | no | the query was too slow; the server is healthy |
+
+`UNKNOWN_OUTCOME` is the only genuinely ambiguous failure here: the transaction either committed
+just before the connection dropped or it did not, and the acknowledgement that would have said which
+is exactly what was lost. So it does not claim the write failed — it names the two ways out, replay
+the idempotency key or re-read. Retrying blindly is how duplicate writes happen, and that ordering
+is mutation-tested.
+
+### Scaling: cost grows with the answer, not the corpus
+
+One measurement says nothing about shape, so the benchmark takes three points:
+
+```
+  1,000 memories  matched=5      server=  0.36ms  client=  5.34ms
+ 10,000 memories  matched=50     server=  0.53ms  client= 11.00ms
+100,000 memories  matched=500    server=  0.67ms  client= 22.80ms
+```
+
+**The corpus grew 100x; query time grew 1.9x.** That is the property that matters for a system meant
+to accumulate knowledge for years.
+
+Two earlier versions of this benchmark asserted that the GIN index appears in the query plan, and
+both were wrong for the same reason: PostgreSQL kept finding cheaper ways to answer than the one the
+test expected. At 100,000 rows it still chooses a sequential scan — and it is right to, because with
+`LIMIT 10` the scan stops as soon as it has ten matches, long before index access plus heap fetches
+would have paid for themselves. The plan is now recorded in
+[`docs/perf/scaling_plan.txt`](docs/perf/scaling_plan.txt) rather than asserted on. An index exists
+to make cost track the answer rather than the table; that property holds regardless of which access
+path the planner picks to deliver it.
+
+### Destroying data is not a tool
+
+`memory_forget` is a soft delete, which is the right default and the wrong operation for the one
+case that genuinely needs destruction: a credential recorded by mistake. That case gets a separate,
+human-invoked, audited path.
+
+```bash
+memhub-admin purge --project my-project --memory <uuid> --yes
+```
+
+It is deliberately not reachable over MCP. A model that misreads a request and calls `memory_forget`
+costs a tombstone that can be undone; the same mistake against `purge` costs the content. Without
+`--yes` it prints what it *would* destroy and stops.
+
+Purge clears every table that holds a copy or a derivative of the content — embeddings, dedup keys,
+attestations, revisions — because a partial erasure of a leaked credential is not an erasure. The
+audit row survives with its detail redacted, which is why `audit_events` has no foreign key to
+`memories`: a `CASCADE` would delete the evidence along with its subject.
+
+Retention (`memhub-admin gc`) never removes a memory. It collects spent idempotency keys and
+long-dead embedding jobs, and nothing else. Retention that silently deleted a project's knowledge
+would be indistinguishable from data loss.
+
+### Refusing to start against the wrong schema
+
+Checked once at startup, and it refuses in **both** directions. A database that is behind fails
+loudly on the first missing column — annoying, but obvious. A database that is *ahead*, migrated by
+a colleague or a deploy that already rolled forward, mostly works, right up until this process
+writes a row that the newer constraints were added to prevent. The quiet direction is the dangerous
+one, and it is the one nobody guards against.
+
 ### What is deliberately not built yet
 
 ### Retrieval
@@ -374,11 +456,14 @@ src/memhub/
   services/        transactions, invariants, policy — no MCP awareness
   persistence/     ORM models, repositories (every method requires a project scope)
   retrieval/       filters.py — the stage-0 filter, written once
+  embeddings/      the port, a local model, and a deterministic fake for CI
   mcp/             thin handlers, schemas, error mapping, stdio entry point
+  cli/             operator commands, deliberately not reachable over MCP
   observability/   JSON logs to stderr (stdout is the JSON-RPC channel)
 migrations/        async Alembic
-tests/             unit, integration, protocol — real PostgreSQL throughout
+tests/             unit, integration, protocol, concurrency, failure, perf
 docs/architecture.md   the design, including what was deliberately not built
+docs/failure-modes.md  every failure the design claims to handle, and its test
 ```
 
 ## Invariants enforced by the database

@@ -25,6 +25,7 @@ dependencies = [
 
 [project.scripts]
 memhub-server = "memhub.mcp.__main__:main"
+memhub-admin = "memhub.cli.admin:main"
 
 [project.optional-dependencies]
 local-embeddings = [
@@ -133,6 +134,7 @@ markers = [
     "perf: seeds a large corpus and measures latency",
     "eval: measures retrieval quality against a graded corpus",
     "real_embeddings: needs a real local embedding model, not the deterministic fake",
+    "failure: exercises the failure matrix in architecture section 9",
 ]
 filterwarnings = [
     "error",

@@ -26,6 +26,7 @@ from memhub.embeddings.worker import EmbeddingWorker
 from memhub.mcp.server import build_server
 from memhub.observability.logging import configure_logging, get_logger
 from memhub.persistence.engine import create_engine, create_session_factory
+from memhub.persistence.schema import SchemaMismatchError, verify
 
 EMBEDDING_POLL_SECONDS = 2.0
 
@@ -40,6 +41,17 @@ async def _serve() -> None:
     log = get_logger("memhub.mcp")
 
     engine = create_engine(settings)
+
+    # Before anything else. A server running against an unmigrated database
+    # does not fail cleanly - it fails on the first query touching a missing
+    # column, which the client reports as a broken tool.
+    try:
+        revision = await verify(engine)
+    except SchemaMismatchError as exc:
+        log.error("refusing to start", extra={"reason": str(exc)})
+        await engine.dispose()
+        raise SystemExit(1) from exc
+
     session_factory = create_session_factory(engine)
     embedder = build_embedder(settings)
     server = build_server(session_factory, embedder=embedder)
@@ -59,6 +71,7 @@ async def _serve() -> None:
         extra={
             "database": settings.sqlalchemy_url.render_as_string(hide_password=True),
             "pool_size": settings.db_pool_size,
+            "schema_revision": revision,
         },
     )
     try:

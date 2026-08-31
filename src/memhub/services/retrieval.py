@@ -28,6 +28,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memhub.domain.enums import MemoryType
@@ -36,6 +37,7 @@ from memhub.embeddings.base import EmbeddingError, EmbeddingPort
 from memhub.observability import metrics as m
 from memhub.persistence.repositories.memories import MemoryRepository, to_view
 from memhub.persistence.repositories.truth import TruthRepository
+from memhub.persistence.sqlstate import QUERY_CANCELED
 from memhub.retrieval import fusion, semantic
 
 _METRICS = m.get_metrics()
@@ -86,6 +88,21 @@ async def hybrid_search(
     except EmbeddingError as exc:
         # The embedder being down must not take search down with it.
         degraded = f"lexical_only: {exc}"
+        _METRICS.increment(m.EMBEDDING_FAILURES, value=1)
+    except DBAPIError as exc:
+        # The semantic leg is the expensive one - an HNSW probe over the whole
+        # project - so it is the leg that hits ``statement_timeout`` first. When
+        # it does, the lexical results are already in hand, and half an answer
+        # beats an error.
+        #
+        # Nothing after this point issues another statement, which matters:
+        # PostgreSQL has aborted the transaction, so any further query would
+        # fail with 25P02. It holds because ``missing`` below is only ever
+        # populated by semantic-only hits, and there are none when the semantic
+        # leg produced nothing.
+        if getattr(getattr(exc, "orig", None), "sqlstate", None) != QUERY_CANCELED:
+            raise
+        degraded = "lexical_only: semantic search exceeded the statement timeout"
         _METRICS.increment(m.EMBEDDING_FAILURES, value=1)
 
     fused = fusion.reciprocal_rank_fusion(

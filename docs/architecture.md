@@ -1358,3 +1358,6 @@ not a new section.
 |---|---|---|
 | Milestone 1 | §3.4(a) | The v2 SDK's `ToolError` carries a message string only, so "`isError: true` with a structured payload" is not expressible. Revision conflicts will return `outcome: "conflict"` as an ordinary structured result instead. |
 | Milestone 1 | §1.3 | Added a rebuttal of *markdown files in the repo, synced by git*. Prompted by reviewing an existing public MCP memory server built exactly that way — it was the cheapest alternative to this design and the one most likely to be raised, and §1.3 had no answer to it. |
+| Milestone 9 | §9 | The degraded marker is `lexical_only: <reason>`, not `fts_only`. Documentation error, found while writing `docs/failure-modes.md`; the mechanism was always as described. |
+| Milestone 9 | §9 | `BACKEND_UNAVAILABLE`, `BACKEND_BUSY` and `UNKNOWN_OUTCOME` were specified here but never implemented - driver failures reached the model as opaque internal errors. Now classified at the MCP boundary, with `DEADLINE_EXCEEDED` added for a cancelled statement, which §9 described but did not name. |
+| Milestone 9 | §9 | The deadline row promised that `memory_context` degrades to lexical-only. It did so for an embedder failure but not for a cancelled statement, which is the likelier cause. The semantic leg now degrades on `57014` as well. |
