@@ -2,6 +2,20 @@
   "instructions": "Shared, versioned project memory for MCP clients.\n\nThis server stores knowledge you explicitly record. It cannot see conversations - it only ever receives the arguments of the tool calls you make to it.\n\nRecord a memory when the user establishes something durable: an architectural decision and what it rules out, a constraint the project must respect, a load-bearing fact, or the piece of work currently in progress. Do not record conversational chatter, and never record credentials.\n\nBefore answering questions about how a project works, search memory first: another client may have recorded the answer in an earlier session.",
   "tools": [
     {
+      "name": "memory_context",
+      "title": "Get a project brief within a token budget",
+      "description": "Get the most useful project knowledge that fits in a given number of tokens. Use this at the start of a session, before you know what you will be asked, or when you need background rather than one specific fact.\n\nThis is not search. Search answers 'what matches this query'; this answers 'given this much room, what is worth knowing'. It balances memory types so constraints are never crowded out by chatter, drops near-duplicates rather than repeating the same decision three times, and returns a readable brief alongside the structured records.\n\nPass a query to focus the brief on a topic; leave it out for a general overview ordered by importance.\n\nThe token count is an estimate: this server does not know which model you are, so it is biased to over-estimate. The budget is never exceeded and may be under-filled by around 10%. The response reports what was spent and what was dropped, so you can ask for more if the brief looks thin.",
+      "input_properties": [
+        "project_id",
+        "query",
+        "token_budget"
+      ],
+      "required": [
+        "project_id"
+      ],
+      "has_output_schema": true
+    },
+    {
       "name": "memory_forget",
       "title": "Retire a memory",
       "description": "Stop a memory appearing in search, because it is no longer relevant or should not have been recorded.\n\nThis tombstones, it does not destroy. Every revision stays readable through memory_history, so the record of what the project once believed survives. Calling it twice is harmless.\n\nUse this when a fact has simply stopped mattering. If it was replaced by a *different* fact, record the new one with supersedes instead - that keeps the connection between old and new, which forgetting loses.\n\nIf a credential was recorded by mistake, forgetting is not enough: it hides the content but does not erase it. Tell the user to run the operator purge command. Permanent erasure is deliberately not available through this interface.",

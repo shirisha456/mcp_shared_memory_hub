@@ -4,7 +4,7 @@ A persistent, versioned memory service that lets multiple MCP-compatible AI clie
 knowledge across sessions, with conflict-safe updates, provenance, hybrid retrieval, stale-memory
 handling, and context-budgeted recall.
 
-**Status: hybrid retrieval.** Six MCP tools over stdio, backed by PostgreSQL, with
+**Status: context budgeting.** Seven MCP tools over stdio, backed by PostgreSQL, with
 compare-and-set updates, idempotent writes, deduplication, stale-memory suppression, and
 keyword + vector search fused by rank. See
 [`docs/architecture.md`](docs/architecture.md) for the full design and
@@ -108,6 +108,7 @@ still appears to work while each client quietly keeps a private corpus.
 | `memory_forget` | Tombstone a memory. Reversible; content is never destroyed. |
 | `memory_search` | Retrieve active memories. Superseded, deleted and expired are never returned. |
 | `memory_history` | Full record for one memory, including retired ones: revisions, lineage, attestations, audit. |
+| `memory_context` | The most useful brief that fits a token budget. Not search — selection under a constraint. |
 
 Plus three read-only resources — identity-addressed and side-effect free, which is what makes them
 resources rather than tools:
@@ -123,9 +124,8 @@ The tool manifest — names, titles, descriptions, schemas — is snapshotted to
 descriptions are the prompt that steers the model, so a wording change alters behaviour with no
 logic change; the snapshot makes that show up in review as a diff.
 
-`memory_context` arrives with the context-budget milestone. Supersession is deliberately not a
-seventh tool: retiring a fact and asserting its replacement are one atomic act, so
-`memory_remember` takes a `supersedes` argument.
+Supersession is deliberately not an eighth tool: retiring a fact and asserting its replacement are
+one atomic act, so `memory_remember` takes a `supersedes` argument.
 
 ## Milestone status
 
@@ -139,8 +139,8 @@ seventh tool: retiring a fact and asserting its replacement are one atomic act, 
 | 5 | Full-text retrieval | done |
 | 6 | Evaluation harness (before vectors, deliberately) | done |
 | 7 | pgvector, embedding outbox, hybrid RRF ranking | done |
-| 8 | Context builder under a token budget | next |
-| 9 | Failure injection, benchmarks, `EXPLAIN ANALYZE` | |
+| 8 | Context builder under a token budget | done |
+| 9 | Failure injection, benchmarks, `EXPLAIN ANALYZE` | next |
 
 ### Concurrency
 
@@ -300,6 +300,40 @@ that fails to start without a network, for a feature meant to be an enhancement.
 CI uses a deterministic hash embedder that carries **no semantic signal**. It exists to exercise the
 outbox, the vector column, fusion and coverage reporting hermetically. It cannot measure quality, and
 the harness does not let it try: the numbers above come from `BAAI/bge-small-en-v1.5` run locally.
+
+### Context budgeting
+
+`memory_context` answers a different question from search. Search asks *what matches this query*;
+this asks *given this much room, what is worth knowing*. Those come apart — the ten most relevant
+memories might be five restatements of one decision plus five details of a task that finished last
+month, and a brief made of those is worse than a shorter one covering four different things.
+
+So it is built as a constrained selection problem: per-type quotas with redistribution, MMR
+diversity, greedy knapsack fill by score-per-token, and a total ordering so identical inputs give
+byte-identical output. Quotas are what stop fifty chatty facts crowding out the two constraints that
+say *never do X*.
+
+**The budget is a guarantee, and the estimator is the interesting part.** The server does not know
+the client's model, so any token count is an approximation — and the two ways to be wrong are not
+comparable. Over-running corrupts the caller's context window; under-filling wastes a little of it.
+The estimator is therefore biased to over-count, and the contract is stated plainly: *never exceed,
+may under-fill by ~10%*.
+
+That bias had to be measured, not assumed. The first divisor (3.6 chars/token) looked safely below
+the ~4.0 quoted for English prose and **under-estimated 2 of 33 real memories** — technical writing
+full of identifiers like `FOR UPDATE SKIP LOCKED` tokenises at 3.25 chars/token. Corrected to 3.2,
+zero samples under-estimate and the worst case is 4.8% over. Full write-up in
+[`docs/eval/tokens.md`](docs/eval/tokens.md).
+
+The response reports what was spent, what was considered, and **why each memory was dropped** —
+`too_similar`, `no_budget_left`, `too_large_alone`. A caller who asked for 2000 tokens and got 400
+needs to distinguish "the project has little to say" from "thirty memories did not fit"; those call
+for opposite responses.
+
+Stale suppression holds here too, tested at **every** budget from 100 to 8000 and every query, with
+the retired memory at maximum importance and its replacement at minimum. It holds for the same
+reason it held through full-text and through vectors: selection can only choose from candidates the
+stage-0 filter already excluded it from.
 
 ### What is deliberately not built yet
 

@@ -25,6 +25,7 @@ from memhub.domain.models import (
     ReviseSucceeded,
     SearchResult,
 )
+from memhub.services.context import ProjectContext
 
 
 class ProjectOut(BaseModel):
@@ -341,4 +342,74 @@ class HistoryOut(BaseModel):
                 )
                 for e in history.audit
             ],
+        )
+
+
+class BudgetOut(BaseModel):
+    """What the selection actually cost, and what it left out.
+
+    Reported rather than hidden because a caller that asked for 2000 tokens and
+    received 900 needs to know whether the project has little to say or whether
+    thirty memories were dropped for lack of room. Those call for opposite
+    responses.
+    """
+
+    requested: int
+    estimated_used: int
+    utilisation: float = Field(
+        description="Fraction of the requested budget spent. Aim is 0.85-0.95."
+    )
+    estimator: str = Field(
+        description=(
+            "How token cost was estimated. This server does not know your "
+            "tokeniser, so the count is an approximation biased to over-estimate: "
+            "the budget is never exceeded, and may be under-filled by about 10%."
+        )
+    )
+    considered: int = Field(description="Memories offered to the selector.")
+    selected: int
+    dropped: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Why memories were left out. 'too_similar' means a near-duplicate of "
+            "something already included; 'no_budget_left' means it did not fit; "
+            "'too_large_alone' means it exceeds the whole budget by itself."
+        ),
+    )
+
+
+class ContextOut(BaseModel):
+    brief: str = Field(description="A readable summary grouped by memory type. Constraints first.")
+    memories: list[MemoryOut] = Field(
+        description="The same memories as structured records, in the same order."
+    )
+    budget: BudgetOut
+    semantic_coverage: float | None = Field(
+        default=None,
+        description=(
+            "Fraction of the project searchable by meaning, when a query was "
+            "given. Below 1.0, a very recent memory may not have been considered."
+        ),
+    )
+    degraded: str | None = Field(
+        default=None, description="Present when part of the retrieval could not run."
+    )
+
+    @classmethod
+    def of(cls, context: ProjectContext) -> ContextOut:
+        selection = context.selection
+        return cls(
+            brief=context.brief,
+            memories=[MemoryOut.of(view) for view in context.memories],
+            budget=BudgetOut(
+                requested=selection.budget,
+                estimated_used=selection.tokens_used,
+                utilisation=round(selection.utilisation, 3),
+                estimator=context.estimator,
+                considered=selection.considered,
+                selected=len(selection.selected),
+                dropped=dict(selection.dropped),
+            ),
+            semantic_coverage=context.semantic_coverage,
+            degraded=context.degraded,
         )

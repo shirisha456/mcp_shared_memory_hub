@@ -7,8 +7,8 @@ load, reading from disk. The gap between server time and client p50 is
 Docker Desktop port forwarding on this development machine, not query
 cost; on a Linux CI runner the two are far closer.
 
-quiescence         matched=   50  server=  2.24ms  cold=  40.55ms  p50= 11.81ms  p95= 15.58ms
-advisory locks     matched=  685  server= 11.48ms  cold=  15.61ms  p50= 19.19ms  p95= 30.72ms
-postgresql         matched=  685  server=  8.25ms  cold=  25.12ms  p50= 25.90ms  p95= 47.27ms
-outbox table       matched=  738  server=  8.60ms  cold=  28.95ms  p50= 24.10ms  p95= 32.71ms
-retry              matched=  614  server= 11.10ms  cold=  22.04ms  p50= 23.80ms  p95= 44.66ms
+quiescence         matched=   50  server=  4.58ms  cold=  41.53ms  p50= 26.02ms  p95= 35.63ms
+advisory locks     matched=  685  server= 12.81ms  cold=  41.08ms  p50= 24.68ms  p95= 28.46ms
+postgresql         matched=  685  server=  7.63ms  cold=  29.02ms  p50= 22.86ms  p95= 41.16ms
+outbox table       matched=  738  server=  9.01ms  cold=  21.97ms  p50= 22.98ms  p95= 33.12ms
+retry              matched=  614  server=  7.15ms  cold=  19.11ms  p50= 23.73ms  p95= 46.90ms

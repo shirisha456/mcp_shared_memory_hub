@@ -40,6 +40,7 @@ EXPECTED_TOOLS = {
     "memory_forget",
     "memory_search",
     "memory_history",
+    "memory_context",
 }
 
 

@@ -11,7 +11,7 @@ store credentials; state a rejected alternative inside the decision rather than
 as a standalone fact. Those sentences are load-bearing for correctness, and the
 golden-manifest protocol test fails if they change by accident.
 
-Six tools. ``memory_context`` arrives with the context-budget milestone.
+Seven tools, which is the whole surface.
 
 Supersession is deliberately *not* a seventh tool: retiring a fact and
 asserting its replacement are one atomic act, so ``memory_remember`` takes a
@@ -41,6 +41,7 @@ from memhub.domain.errors import ValidationFailedError
 from memhub.embeddings.base import EmbeddingPort
 from memhub.mcp.mapping import domain_errors
 from memhub.mcp.schemas import (
+    ContextOut,
     ForgetOut,
     HistoryOut,
     MemoryOut,
@@ -52,6 +53,7 @@ from memhub.mcp.schemas import (
 from memhub.persistence.engine import session_scope
 from memhub.persistence.models import Memory
 from memhub.persistence.repositories.projects import ProjectRepository
+from memhub.services import context as context_service
 from memhub.services import memories as memory_service
 from memhub.services import projects as project_service
 from memhub.services import retrieval as retrieval_service
@@ -381,6 +383,54 @@ def build_server(
                     limit=limit,
                 )
             return SearchOut.of(result)
+
+    @server.tool(
+        name="memory_context",
+        title="Get a project brief within a token budget",
+        description=(
+            "Get the most useful project knowledge that fits in a given number of "
+            "tokens. Use this at the start of a session, before you know what you "
+            "will be asked, or when you need background rather than one specific "
+            "fact.\n\n"
+            "This is not search. Search answers 'what matches this query'; this "
+            "answers 'given this much room, what is worth knowing'. It balances "
+            "memory types so constraints are never crowded out by chatter, drops "
+            "near-duplicates rather than repeating the same decision three times, "
+            "and returns a readable brief alongside the structured records.\n\n"
+            "Pass a query to focus the brief on a topic; leave it out for a "
+            "general overview ordered by importance.\n\n"
+            "The token count is an estimate: this server does not know which model "
+            "you are, so it is biased to over-estimate. The budget is never "
+            "exceeded and may be under-filled by around 10%. The response reports "
+            "what was spent and what was dropped, so you can ask for more if the "
+            "brief looks thin."
+        ),
+    )
+    @domain_errors
+    async def memory_context(
+        project_id: Annotated[str, Field(description="From project_use.")],
+        query: Annotated[
+            str | None,
+            Field(description="Focus the brief on a topic. Omit for a general overview."),
+        ] = None,
+        token_budget: Annotated[
+            int,
+            Field(
+                description="How many tokens the brief may cost. 2000 is a sensible default.",
+                ge=100,
+                le=32000,
+            ),
+        ] = 2000,
+    ) -> ContextOut:
+        async with session_scope(session_factory) as session:
+            built = await context_service.build_context(
+                session,
+                _parse_uuid(project_id, "project_id"),
+                query=query,
+                token_budget=token_budget,
+                embedder=embedder,
+            )
+            return ContextOut.of(built)
 
     @server.tool(
         name="memory_forget",
