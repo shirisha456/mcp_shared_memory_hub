@@ -1,0 +1,22 @@
+[
+  {
+    "strategy": "full-text, all terms required (ts_rank_cd + priors)",
+    "note": "PostgreSQL joins bare query terms with AND, so a natural-language question needs every word present. 'migration rules' and 'connection pool size' returned nothing at all.",
+    "ndcg": 0.4783,
+    "recall": 0.4677,
+    "precision": 0.4839,
+    "mrr": 0.4839,
+    "stale_inclusion_rate": 0.0,
+    "empty_for_unanswerable": 0.6667
+  },
+  {
+    "strategy": "full-text, any-term fallback when the strict query finds nothing",
+    "note": "Precision is preserved for queries that match strictly; the widening only happens when the alternative is returning nothing. Stale inclusion stayed at exactly zero, which is the useful part: loosening the match did not loosen the correctness guarantee, because suppression is structural rather than a ranking effect.",
+    "ndcg": 0.8025,
+    "recall": 0.8172,
+    "precision": 0.691,
+    "mrr": 0.8226,
+    "stale_inclusion_rate": 0.0,
+    "empty_for_unanswerable": 0.6667
+  }
+]

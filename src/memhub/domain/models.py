@@ -189,5 +189,14 @@ class SearchResult:
     are 300 and you are seeing the first 10".
     """
 
+    match_strategy: Literal["all_terms", "any_term"] = "all_terms"
+    """How the query was matched.
+
+    ``all_terms`` is the strict interpretation and the default. ``any_term``
+    means the strict query found nothing and the search widened - reported rather
+    than hidden, because a caller reading loosely matched results should know
+    that is what they are.
+    """
+
     def returned_count(self) -> int:
         return len(self.memories)

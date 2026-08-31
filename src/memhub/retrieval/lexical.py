@@ -83,3 +83,37 @@ def relevance(query: str) -> ColumnElement[float]:
         to_query(query),
         32,
     ).cast(Float)
+
+
+# Characters and words that mean the caller is using explicit search syntax.
+# A quoted phrase, a negation, or an existing OR is a deliberate expression of
+# intent, and rewriting it would answer a different question than the one asked.
+_EXPLICIT_SYNTAX = ('"', "-", " or ", " OR ")
+
+
+def any_term_query(query: str) -> str | None:
+    """Rewrite a plain query so any single term matches, or ``None`` to decline.
+
+    ``websearch_to_tsquery`` joins bare terms with AND, so "connection pool size"
+    requires all three lexemes and misses a memory that says "connection pooling
+    is bounded at 10" - it has no "size". Natural-language questions are mostly
+    like this: "what queue does this project use" demands *queue* and *project*
+    and *use* together, and returns nothing.
+
+    That is the single largest weakness in the measured full-text baseline, so
+    the search path retries with this form when the strict query finds nothing.
+    Relevance still does the work: ``ts_rank_cd`` ranks a memory matching three
+    terms above one matching one, so widening the net does not flatten the
+    ordering.
+
+    Returns ``None`` when the query already uses explicit syntax. A caller who
+    wrote ``queueing -redis`` meant it, and turning that into an OR would
+    silently invert their intent.
+    """
+    if any(marker in query for marker in _EXPLICIT_SYNTAX):
+        return None
+
+    terms = query.split()
+    if len(terms) < 2:
+        return None
+    return " or ".join(terms)

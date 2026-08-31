@@ -50,6 +50,7 @@ from memhub.observability import metrics as m
 from memhub.persistence.repositories.audit import AuditRepository
 from memhub.persistence.repositories.memories import MemoryRepository, to_view
 from memhub.persistence.repositories.truth import TruthRepository
+from memhub.retrieval import lexical
 from memhub.services import idempotency
 
 _METRICS = m.get_metrics()
@@ -536,27 +537,50 @@ async def search(
     tags: Sequence[str] | None = None,
     limit: int | None = None,
 ) -> SearchResult:
-    """Retrieve active memories.
+    """Retrieve active memories, ranked by relevance and priors.
 
-    No relevance ranking. Results are ordered by importance, then recency, then
-    id - a deterministic total order, so identical calls return identical
-    results. Ranking arrives in Milestone 5, *after* Milestone 6 builds the
-    evaluation harness that can prove it is an improvement.
+    **Two-stage matching.** PostgreSQL's ``websearch_to_tsquery`` joins bare
+    terms with AND, so "connection pool size" demands all three lexemes and
+    misses a memory saying "connection pooling is bounded at 10". Natural
+    language is full of this, and it is what a model sends: the measured
+    all-terms baseline scored 0.000 nDCG on queries as ordinary as "migration
+    rules".
+
+    So a query that finds nothing is retried with any-term matching. Precision is
+    preserved for queries that do match strictly - the widening only happens when
+    the alternative is returning nothing - and relevance still orders the result,
+    since a memory matching three terms outranks one matching a single term.
+
+    Queries using explicit syntax are never rewritten: ``queueing -redis`` means
+    what it says, and turning it into an OR would invert the caller's intent.
+
+    The strategy that produced the results is reported rather than hidden, so a
+    caller reading loosely matched results knows that is what they are.
     """
     clean_limit = validate_limit(limit)
     clean_tags = validate_tags(list(tags) if tags else None)
     clean_query = query.strip() if query and query.strip() else None
 
     repo = MemoryRepository(session)
-    rows = await repo.search(
-        project_id, query=clean_query, types=types, tags=clean_tags, limit=clean_limit
-    )
-    total = await repo.count(project_id, query=clean_query, types=types, tags=clean_tags)
 
-    return SearchResult(
-        memories=tuple(to_view(memory, revision) for memory, revision in rows),
-        total_considered=total,
-    )
+    async def run(text_query: str | None) -> tuple[tuple[MemoryView, ...], int]:
+        rows = await repo.search(
+            project_id, query=text_query, types=types, tags=clean_tags, limit=clean_limit
+        )
+        total = await repo.count(project_id, query=text_query, types=types, tags=clean_tags)
+        return tuple(to_view(memory, revision) for memory, revision in rows), total
+
+    memories, total = await run(clean_query)
+    if memories or clean_query is None:
+        return SearchResult(memories=memories, total_considered=total, match_strategy="all_terms")
+
+    widened = lexical.any_term_query(clean_query)
+    if widened is None:
+        return SearchResult(memories=memories, total_considered=total, match_strategy="all_terms")
+
+    memories, total = await run(widened)
+    _METRICS.increment(m.SEARCH_WIDENED)
+    return SearchResult(memories=memories, total_considered=total, match_strategy="any_term")
 
 
 async def get_memory(

@@ -1,0 +1,284 @@
+# Evaluation corpus: hand-written core memories.
+#
+# These are the memories the graded queries in queries.yaml judge against. They
+# describe one plausible project in enough detail that queries have real
+# competition - a corpus where every query has exactly one possible answer
+# measures nothing.
+#
+# Deliberate difficulty is built in:
+#
+#   * Superseded pairs (m101/m102 and friends). The retired memory usually
+#     matches the query wording BETTER than its replacement, which is exactly the
+#     case a similarity-only system gets wrong.
+#   * Near-misses. Several memories share vocabulary with a query but answer a
+#     different question.
+#   * A second project (expense-tracker) containing memories that would be
+#     plausible answers if isolation leaked.
+#
+# Distractors are generated on top of this to reach the full corpus size; see
+# tests/eval/dataset.py.
+
+project: ai-agent-control-plane
+
+memories:
+  # --- queueing: the running example, with a supersession pair -------------
+  - id: m101
+    type: FACT
+    content: "Redis is the task queue. Workers poll it with BRPOP."
+    importance: 60
+    tags: [queue, redis]
+    superseded_by: m102
+
+  - id: m102
+    type: DECISION
+    content: >-
+      PostgreSQL is the source of truth for task state and queueing, claimed with
+      SELECT FOR UPDATE SKIP LOCKED. Redis was removed in V1 because a second
+      datastore meant task state and queue state could disagree.
+    importance: 90
+    tags: [queue, postgres, architecture]
+
+  - id: m103
+    type: CONSTRAINT
+    content: "No second datastore may be introduced without a written capacity argument."
+    importance: 85
+    tags: [architecture]
+
+  - id: m104
+    type: FACT
+    content: "Queue claims are batched at 16 rows per poll to amortise round trips."
+    importance: 50
+    tags: [queue, performance]
+
+  - id: m105
+    type: FACT
+    content: >-
+      A task that fails five times is moved to the dead letter table rather than
+      retried indefinitely.
+    importance: 60
+    tags: [queue, reliability]
+
+  # --- near-misses that share queue vocabulary ----------------------------
+  - id: m106
+    type: FACT
+    content: "The webhook dispatcher has its own in-memory queue, unrelated to task state."
+    importance: 30
+    tags: [webhooks]
+
+  - id: m107
+    type: FACT
+    content: "Queue depth is exported as a gauge, not a counter."
+    importance: 35
+    tags: [observability, queue]
+
+  # --- database and migrations ---------------------------------------------
+  - id: m201
+    type: DECISION
+    content: >-
+      Alembic migrations must maintain a single head. Branching migration history
+      makes upgrade order non-deterministic across environments.
+    importance: 80
+    tags: [migrations, database]
+
+  - id: m202
+    type: CONSTRAINT
+    content: "Every migration must be reversible, or its irreversibility documented in the revision."
+    importance: 75
+    tags: [migrations]
+
+  - id: m203
+    type: FACT
+    content: "Connection pooling is bounded at 10 with a 2 second acquire timeout."
+    importance: 65
+    tags: [database, performance]
+
+  - id: m204
+    type: DECISION
+    content: >-
+      The application never sets timestamps. All of them come from the database
+      clock, so two server processes cannot disagree about ordering.
+    importance: 80
+    tags: [database, correctness]
+
+  - id: m205
+    type: FACT
+    content: "Statement timeout is 5 seconds, applied server-side per connection."
+    importance: 55
+    tags: [database, performance]
+
+  # --- concurrency ---------------------------------------------------------
+  - id: m301
+    type: DECISION
+    content: >-
+      Updates use a single-statement compare-and-set at READ COMMITTED. The losing
+      writer matches zero rows and receives a conflict rather than a retryable
+      exception.
+    importance: 95
+    tags: [concurrency, correctness]
+
+  - id: m302
+    type: FACT
+    content: >-
+      SERIALIZABLE was rejected for updates: it raises 40001 on collision, turning
+      a clean refusal into a retry storm under contention.
+    importance: 70
+    tags: [concurrency]
+
+  - id: m303
+    type: CONSTRAINT
+    content: "All write paths must take row locks in the same order, so no cycle can form."
+    importance: 85
+    tags: [concurrency, correctness]
+
+  - id: m304
+    type: FACT
+    content: "Idempotency keys are claimed with INSERT ON CONFLICT DO NOTHING, never check-then-insert."
+    importance: 75
+    tags: [idempotency, concurrency]
+
+  # --- observability, with a supersession pair -----------------------------
+  - id: m401
+    type: DECISION
+    content: "Metrics are scraped by Prometheus from a /metrics endpoint on each worker."
+    importance: 55
+    tags: [observability]
+    superseded_by: m402
+
+  - id: m402
+    type: DECISION
+    content: >-
+      Metrics are pushed over OTLP to a collector. Scraping was abandoned because
+      workers are short-lived processes that a scraper cannot reliably find.
+    importance: 75
+    tags: [observability, otlp]
+
+  - id: m403
+    type: CONSTRAINT
+    content: >-
+      High-cardinality identifiers such as task_id must never be used as metric
+      labels. They belong in traces.
+    importance: 80
+    tags: [observability]
+
+  - id: m404
+    type: FACT
+    content: "All logs are JSON on stderr. stdout is reserved for protocol traffic."
+    importance: 70
+    tags: [observability, logging]
+
+  # --- auth, with a supersession pair --------------------------------------
+  - id: m501
+    type: DECISION
+    content: "API authentication uses long-lived static API keys stored in the database."
+    importance: 60
+    tags: [auth, security]
+    superseded_by: m502
+
+  - id: m502
+    type: DECISION
+    content: >-
+      API authentication uses short-lived JWTs signed by the control plane. Static
+      API keys were removed because they could not be rotated without downtime.
+    importance: 85
+    tags: [auth, security, jwt]
+
+  - id: m503
+    type: CONSTRAINT
+    content: "Credentials must never be written to logs, metrics or memory storage."
+    importance: 95
+    tags: [security]
+
+  # --- testing -------------------------------------------------------------
+  - id: m601
+    type: DECISION
+    content: >-
+      Integration tests run against real PostgreSQL. SQLite would invalidate every
+      guarantee that depends on PostgreSQL-specific behaviour.
+    importance: 80
+    tags: [testing]
+
+  - id: m602
+    type: FACT
+    content: >-
+      Concurrency tests assert the pool can supply N distinct backends before
+      claiming N-way concurrency, otherwise they measure sequential waves.
+    importance: 70
+    tags: [testing, concurrency]
+
+  - id: m603
+    type: FACT
+    content: "Test isolation uses template database cloning rather than re-running migrations."
+    importance: 55
+    tags: [testing]
+
+  # --- language and tooling ------------------------------------------------
+  - id: m701
+    type: CONSTRAINT
+    content: "Python 3.12 or newer is required. Older versions are not supported."
+    importance: 70
+    tags: [tooling]
+
+  - id: m702
+    type: FACT
+    content: "Type checking is mypy in strict mode, and it gates the build."
+    importance: 60
+    tags: [tooling]
+
+  - id: m703
+    type: FACT
+    content: "Linting and formatting are both ruff. There is no separate formatter."
+    importance: 45
+    tags: [tooling]
+
+  # --- deployment ----------------------------------------------------------
+  - id: m801
+    type: FACT
+    content: "The service runs as a stdio subprocess spawned by each client, not as a shared daemon."
+    importance: 75
+    tags: [deployment, architecture]
+
+  - id: m802
+    type: DECISION
+    content: >-
+      Remote HTTP transport is deferred until authentication is designed. Exposing
+      the current server over a network would have no access control at all.
+    importance: 70
+    tags: [deployment, security]
+
+  # --- current work (short-lived) ------------------------------------------
+  - id: m901
+    type: TASK
+    content: "Currently implementing worker heartbeat logic in the scheduler."
+    importance: 40
+    tags: [scheduler]
+    expires_in_days: 14
+
+  - id: m902
+    type: TASK
+    content: "Currently benchmarking queue claim latency at 100k rows."
+    importance: 40
+    tags: [queue, performance]
+    expires_in_days: 7
+
+# A second project. Nothing here should ever appear in results for the project
+# above; these exist so isolation failures show up as a metric rather than as a
+# surprise.
+other_project: expense-tracker
+other_memories:
+  - id: x101
+    type: DECISION
+    content: "SQLite is the task queue for the expense tracker; it runs on one machine."
+    importance: 80
+    tags: [queue]
+
+  - id: x102
+    type: CONSTRAINT
+    content: "Credentials must never be written to logs in the expense tracker either."
+    importance: 80
+    tags: [security]
+
+  - id: x103
+    type: DECISION
+    content: "Authentication for the expense tracker uses session cookies, not JWTs."
+    importance: 70
+    tags: [auth]

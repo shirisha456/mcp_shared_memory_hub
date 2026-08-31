@@ -1,0 +1,212 @@
+# Graded relevance judgments.
+#
+# grade 2 = directly answers the question
+# grade 1 = useful context a good result set would include
+# absent   = irrelevant
+#
+# `forbidden` lists memories that must NEVER appear in the top k. These are
+# almost all superseded facts, and they are the point of the whole exercise: a
+# retired memory usually matches the query wording better than its replacement,
+# so a similarity-only system ranks it first. stale_inclusion_rate must be 0.
+#
+# Judgments were written before any metric was run. Writing them afterwards
+# would mean grading whatever the system happened to return.
+
+queries:
+  # --- the running example ------------------------------------------------
+  - id: q01
+    query: "what queue does this project use"
+    relevant: {m102: 2, m103: 1, m104: 1}
+    forbidden: [m101]
+
+  - id: q02
+    query: "redis"
+    relevant: {m102: 2}
+    forbidden: [m101]
+    note: >-
+      The hardest case. The retired memory is about Redis and mentions it twice;
+      the current one mentions it only to say it was removed. Lexical relevance
+      alone would rank the retired one first, which is why suppression has to be
+      structural rather than a ranking effect.
+
+  - id: q03
+    query: "task queue claiming"
+    relevant: {m102: 2, m104: 1}
+    forbidden: [m101]
+
+  - id: q04
+    query: "what happens to a task that keeps failing"
+    relevant: {m105: 2}
+    forbidden: []
+
+  - id: q05
+    query: "can we add another datastore"
+    relevant: {m103: 2, m102: 1}
+    forbidden: []
+
+  # --- database -----------------------------------------------------------
+  - id: q06
+    query: "migration rules"
+    relevant: {m201: 2, m202: 2}
+    forbidden: []
+
+  - id: q07
+    query: "why single head alembic"
+    relevant: {m201: 2}
+    forbidden: []
+
+  - id: q08
+    query: "connection pool size"
+    relevant: {m203: 2}
+    forbidden: []
+
+  - id: q09
+    query: "where do timestamps come from"
+    relevant: {m204: 2}
+    forbidden: []
+
+  - id: q10
+    query: "statement timeout"
+    relevant: {m205: 2}
+    forbidden: []
+
+  # --- concurrency --------------------------------------------------------
+  - id: q11
+    query: "how are concurrent updates handled"
+    relevant: {m301: 2, m303: 1, m302: 1}
+    forbidden: []
+
+  - id: q12
+    query: "why not serializable isolation"
+    relevant: {m302: 2, m301: 1}
+    forbidden: []
+
+  - id: q13
+    query: "deadlock prevention"
+    relevant: {m303: 2}
+    forbidden: []
+
+  - id: q14
+    query: "idempotency"
+    relevant: {m304: 2}
+    forbidden: []
+
+  - id: q15
+    query: "compare and set"
+    relevant: {m301: 2}
+    forbidden: []
+
+  # --- observability ------------------------------------------------------
+  - id: q16
+    query: "how are metrics collected"
+    relevant: {m402: 2, m403: 1}
+    forbidden: [m401]
+
+  - id: q17
+    query: "prometheus scraping"
+    relevant: {m402: 2}
+    forbidden: [m401]
+    note: >-
+      Another better-matching retired memory: the superseded decision is the one
+      that actually mentions Prometheus scraping.
+
+  - id: q18
+    query: "metric labels cardinality"
+    relevant: {m403: 2}
+    forbidden: []
+
+  - id: q19
+    query: "where do logs go"
+    relevant: {m404: 2}
+    forbidden: []
+
+  # --- auth ---------------------------------------------------------------
+  - id: q20
+    query: "how does authentication work"
+    relevant: {m502: 2, m503: 1}
+    forbidden: [m501]
+
+  - id: q21
+    query: "api keys"
+    relevant: {m502: 2}
+    forbidden: [m501]
+    note: "The retired decision is the one about API keys. Same trap as q02 and q17."
+
+  - id: q22
+    query: "jwt"
+    relevant: {m502: 2}
+    forbidden: []
+
+  - id: q23
+    query: "can we log credentials"
+    relevant: {m503: 2}
+    forbidden: []
+
+  # --- testing ------------------------------------------------------------
+  - id: q24
+    query: "why real postgresql in tests"
+    relevant: {m601: 2}
+    forbidden: []
+
+  - id: q25
+    query: "concurrency test pitfalls"
+    relevant: {m602: 2}
+    forbidden: []
+
+  - id: q26
+    query: "test isolation"
+    relevant: {m603: 2}
+    forbidden: []
+
+  # --- tooling ------------------------------------------------------------
+  - id: q27
+    query: "python version"
+    relevant: {m701: 2}
+    forbidden: []
+
+  - id: q28
+    query: "type checking"
+    relevant: {m702: 2}
+    forbidden: []
+
+  # --- deployment ---------------------------------------------------------
+  - id: q29
+    query: "how is the server deployed"
+    relevant: {m801: 2, m802: 1}
+    forbidden: []
+
+  - id: q30
+    query: "remote access"
+    relevant: {m802: 2}
+    forbidden: []
+
+  # --- current work -------------------------------------------------------
+  - id: q31
+    query: "what is being worked on right now"
+    relevant: {m901: 2, m902: 2}
+    forbidden: []
+
+  # --- cross-project isolation traps --------------------------------------
+  - id: q32
+    query: "sqlite"
+    relevant: {}
+    forbidden: [x101]
+    note: >-
+      Nothing in this project uses SQLite. The only matching memory belongs to
+      another project, so the correct answer is an empty result set. Isolation
+      failures show up here.
+
+  - id: q33
+    query: "session cookies"
+    relevant: {}
+    forbidden: [x103]
+
+  # --- queries with no good answer ----------------------------------------
+  - id: q34
+    query: "kubernetes deployment strategy"
+    relevant: {}
+    forbidden: []
+    note: >-
+      Nothing in the corpus answers this. Included because returning confident
+      nonsense for an unanswerable question is a real failure mode, and a corpus
+      where every query has an answer never tests for it.

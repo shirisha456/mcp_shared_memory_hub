@@ -136,8 +136,8 @@ seventh tool: retiring a fact and asserting its replacement are one atomic act, 
 | 3 | Deduplication, attestations, supersession, forget, history | done |
 | 4 | Claude Desktop / Cursor integration, golden manifest | done |
 | 5 | Full-text retrieval | done |
-| 6 | Evaluation harness (before vectors, deliberately) | next |
-| 7 | pgvector, embedding outbox, hybrid RRF ranking | |
+| 6 | Evaluation harness (before vectors, deliberately) | done |
+| 7 | pgvector, embedding outbox, hybrid RRF ranking | next |
 | 8 | Context builder under a token budget | |
 | 9 | Failure injection, benchmarks, `EXPLAIN ANALYZE` | |
 
@@ -211,6 +211,35 @@ retrying in a loop cannot manufacture corroboration.
 The dedup key lives in its own table rather than as a partial unique index, because the rule spans
 two tables — `is_current` on the revision, `status` on the memory — and no index can. Retirement
 releases the key, so a sentence can be legitimately re-asserted if a decision is reversed.
+
+### Retrieval quality is measured, not asserted
+
+200-memory corpus, 34 queries with graded relevance judgments written **before** anything was
+measured. Full results in [`docs/eval/results.md`](docs/eval/results.md); the numbers are gated
+against a committed baseline, so a regression fails the build rather than going unnoticed.
+
+| Strategy | nDCG@10 | Recall@10 | Precision@10 | Stale inclusion |
+|---|---|---|---|---|
+| full-text, all terms required | 0.478 | 0.468 | 0.484 | **0.000** |
+| full-text, any-term fallback | 0.802 | 0.817 | 0.691 | **0.000** |
+
+The harness immediately found a real defect. PostgreSQL joins bare query terms with AND, so
+"connection pool size" demands all three lexemes and misses a memory saying "connection pooling is
+bounded at 10" — questions as ordinary as "migration rules" returned *nothing*. A query that finds
+nothing now retries with any-term matching, which is where the jump came from. Precision holds
+because the widening only happens when the alternative is an empty result.
+
+**Stale inclusion stayed at exactly 0.000 through both.** That is the useful part: loosening the
+match did not loosen the correctness guarantee, because suppression is structural rather than a
+ranking effect. Several queries are built to punish a similarity-only system — `q02` asks for
+"redis" when the *retired* memory is about Redis and the current one mentions it only to say it was
+removed.
+
+Three queries still score zero, and all three are vocabulary gaps rather than bugs: `jwt` does not
+match `JWTs` (Snowball does not stem acronym plurals), "deadlock prevention" misses a memory that
+describes deadlock prevention without using the word, and "worked on right now" misses "Currently
+implementing". That is the concrete target for semantic retrieval — measured first, so the claim
+that it helps will be a number.
 
 ### What is deliberately not built yet
 

@@ -9,38 +9,33 @@ as the corpus grows.
 
 === planner's natural choice ===
 
-Limit  (cost=495.31..495.33 rows=10 width=571) (actual time=0.264..0.265 rows=10 loops=1)
-  ->  Sort  (cost=495.31..495.43 rows=50 width=571) (actual time=0.263..0.264 rows=10 loops=1)
+Limit  (cost=1023.21..1023.23 rows=10 width=571) (actual time=3.660..3.666 rows=10 loops=1)
+  ->  Sort  (cost=1023.21..1023.33 rows=50 width=571) (actual time=3.658..3.661 rows=10 loops=1)
         Sort Key: (((((ts_rank_cd(memory_revisions.content_tsv, '''quiescenc'''::tsquery, 32))::double precision * ('1'::double precision + ('0.5'::double precision * ((memories.importance)::double precision / '100'::double precision)))) * ('1'::double precision + ('0.3'::double precision * power('0.5'::double precision, (((EXTRACT(epoch FROM (now() - memories.created_at)))::double precision / '86400'::double precision) / (CASE WHEN (memories.type = 'CONSTRAINT'::text) THEN 3650.0 WHEN (memories.type = 'DECISION'::text) THEN 365.0 WHEN (memories.type = 'FACT'::text) THEN 180.0 WHEN (memories.type = 'TASK'::text) THEN 7.0 ELSE 365.0 END)::double precision))))) * (CASE WHEN (memories.type = 'CONSTRAINT'::text) THEN 1.15 WHEN (memories.type = 'DECISION'::text) THEN 1.1 WHEN (memories.type = 'FACT'::text) THEN 1.0 WHEN (memories.type = 'TASK'::text) THEN 0.95 ELSE 1.0 END)::double precision)) DESC, memories.id
         Sort Method: top-N heapsort  Memory: 42kB
-        ->  Nested Loop  (cost=13.37..494.23 rows=50 width=571) (actual time=0.033..0.237 rows=50 loops=1)
-              ->  Bitmap Heap Scan on memory_revisions  (cost=13.08..163.10 rows=50 width=454) (actual time=0.017..0.067 rows=50 loops=1)
-                    Recheck Cond: ((content_tsv @@ '''quiescenc'''::tsquery) AND is_current)
-                    Filter: (project_id = 'e642703f-a6fd-4dcf-ad72-5d7efcd7308e'::uuid)
-                    Heap Blocks: exact=47
-                    ->  Bitmap Index Scan on ix_memory_revisions_content_tsv  (cost=0.00..13.07 rows=50 width=0) (actual time=0.010..0.010 rows=50 loops=1)
-                          Index Cond: (content_tsv @@ '''quiescenc'''::tsquery)
-              ->  Index Scan using pk_memories on memories  (cost=0.29..6.55 rows=1 width=109) (actual time=0.002..0.002 rows=1 loops=50)
+        ->  Nested Loop  (cost=0.29..1022.13 rows=50 width=571) (actual time=0.061..3.599 rows=50 loops=1)
+              ->  Seq Scan on memory_revisions  (cost=0.00..695.00 rows=50 width=454) (actual time=0.026..3.109 rows=50 loops=1)
+                    Filter: (is_current AND (content_tsv @@ '''quiescenc'''::tsquery) AND (project_id = '7757cfd2-5d2a-4e73-8053-77e508cf7fcd'::uuid))
+                    Rows Removed by Filter: 9950
+              ->  Index Scan using pk_memories on memories  (cost=0.29..6.47 rows=1 width=109) (actual time=0.006..0.006 rows=1 loops=50)
                     Index Cond: (id = memory_revisions.memory_id)
-                    Filter: ((project_id = 'e642703f-a6fd-4dcf-ad72-5d7efcd7308e'::uuid) AND (status = 'ACTIVE'::text) AND ((expires_at IS NULL) OR (expires_at > now())))
-Planning Time: 0.252 ms
-Execution Time: 0.299 ms
+                    Filter: ((project_id = '7757cfd2-5d2a-4e73-8053-77e508cf7fcd'::uuid) AND (status = 'ACTIVE'::text) AND ((expires_at IS NULL) OR (expires_at > now())))
+Planning Time: 0.851 ms
+Execution Time: 3.741 ms
 
 === with enable_seqscan = off ===
 
-Limit  (cost=495.31..495.33 rows=10 width=571) (actual time=0.266..0.268 rows=10 loops=1)
-  ->  Sort  (cost=495.31..495.43 rows=50 width=571) (actual time=0.266..0.267 rows=10 loops=1)
+Limit  (cost=1116.49..1116.52 rows=10 width=571) (actual time=4.090..4.095 rows=10 loops=1)
+  ->  Sort  (cost=1116.49..1116.62 rows=50 width=571) (actual time=4.088..4.090 rows=10 loops=1)
         Sort Key: (((((ts_rank_cd(memory_revisions.content_tsv, '''quiescenc'''::tsquery, 32))::double precision * ('1'::double precision + ('0.5'::double precision * ((memories.importance)::double precision / '100'::double precision)))) * ('1'::double precision + ('0.3'::double precision * power('0.5'::double precision, (((EXTRACT(epoch FROM (now() - memories.created_at)))::double precision / '86400'::double precision) / (CASE WHEN (memories.type = 'CONSTRAINT'::text) THEN 3650.0 WHEN (memories.type = 'DECISION'::text) THEN 365.0 WHEN (memories.type = 'FACT'::text) THEN 180.0 WHEN (memories.type = 'TASK'::text) THEN 7.0 ELSE 365.0 END)::double precision))))) * (CASE WHEN (memories.type = 'CONSTRAINT'::text) THEN 1.15 WHEN (memories.type = 'DECISION'::text) THEN 1.1 WHEN (memories.type = 'FACT'::text) THEN 1.0 WHEN (memories.type = 'TASK'::text) THEN 0.95 ELSE 1.0 END)::double precision)) DESC, memories.id
         Sort Method: top-N heapsort  Memory: 42kB
-        ->  Nested Loop  (cost=13.37..494.23 rows=50 width=571) (actual time=0.032..0.239 rows=50 loops=1)
-              ->  Bitmap Heap Scan on memory_revisions  (cost=13.08..163.10 rows=50 width=454) (actual time=0.017..0.065 rows=50 loops=1)
-                    Recheck Cond: ((content_tsv @@ '''quiescenc'''::tsquery) AND is_current)
-                    Filter: (project_id = 'e642703f-a6fd-4dcf-ad72-5d7efcd7308e'::uuid)
-                    Heap Blocks: exact=47
-                    ->  Bitmap Index Scan on ix_memory_revisions_content_tsv  (cost=0.00..13.07 rows=50 width=0) (actual time=0.009..0.009 rows=50 loops=1)
-                          Index Cond: (content_tsv @@ '''quiescenc'''::tsquery)
-              ->  Index Scan using pk_memories on memories  (cost=0.29..6.55 rows=1 width=109) (actual time=0.002..0.002 rows=1 loops=50)
+        ->  Nested Loop  (cost=0.57..1115.41 rows=50 width=571) (actual time=0.089..4.024 rows=50 loops=1)
+              ->  Index Scan using ix_memory_revisions_project_id on memory_revisions  (cost=0.29..788.28 rows=50 width=454) (actual time=0.048..3.618 rows=50 loops=1)
+                    Index Cond: (project_id = '7757cfd2-5d2a-4e73-8053-77e508cf7fcd'::uuid)
+                    Filter: (is_current AND (content_tsv @@ '''quiescenc'''::tsquery))
+                    Rows Removed by Filter: 9950
+              ->  Index Scan using pk_memories on memories  (cost=0.29..6.47 rows=1 width=109) (actual time=0.004..0.004 rows=1 loops=50)
                     Index Cond: (id = memory_revisions.memory_id)
-                    Filter: ((project_id = 'e642703f-a6fd-4dcf-ad72-5d7efcd7308e'::uuid) AND (status = 'ACTIVE'::text) AND ((expires_at IS NULL) OR (expires_at > now())))
-Planning Time: 0.256 ms
-Execution Time: 0.300 ms
+                    Filter: ((project_id = '7757cfd2-5d2a-4e73-8053-77e508cf7fcd'::uuid) AND (status = 'ACTIVE'::text) AND ((expires_at IS NULL) OR (expires_at > now())))
+Planning Time: 0.722 ms
+Execution Time: 4.171 ms
