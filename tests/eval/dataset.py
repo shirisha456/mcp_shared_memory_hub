@@ -99,7 +99,7 @@ def distractor_contents(count: int, *, seed: int = DISTRACTOR_SEED) -> list[str]
     return [f"{rng.choice(subjects)} {rng.choice(predicates)} (detail {i})." for i in range(count)]
 
 
-async def seed_corpus(session: AsyncSession) -> SeededCorpus:
+async def seed_corpus(session: AsyncSession, *, embedding_model: str | None = None) -> SeededCorpus:
     """Write the corpus, applying supersession exactly as a client would.
 
     Superseded memories are created first, then retired by the memory that
@@ -139,6 +139,7 @@ async def seed_corpus(session: AsyncSession) -> SeededCorpus:
             expires_at=expires_at,
             supersedes=[by_eval_id[old] for old in retires.get(entry["id"], [])] or None,
             author_client="claude-desktop",
+            embedding_model=embedding_model,
         )
         by_eval_id[entry["id"]] = result.memory.memory_id
 
@@ -151,6 +152,7 @@ async def seed_corpus(session: AsyncSession) -> SeededCorpus:
             tags=entry.get("tags"),
             importance=entry.get("importance"),
             author_client="cursor",
+            embedding_model=embedding_model,
         )
         by_eval_id[entry["id"]] = result.memory.memory_id
 
@@ -163,6 +165,7 @@ async def seed_corpus(session: AsyncSession) -> SeededCorpus:
             content=content,
             importance=30,
             author_client="cursor",
+            embedding_model=embedding_model,
         )
         by_eval_id[f"d{index:03d}"] = result.memory.memory_id
 

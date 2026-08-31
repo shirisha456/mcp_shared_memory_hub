@@ -72,3 +72,8 @@ jobs:
 
       - name: pytest
         run: pytest -v
+
+      - name: benchmarks
+        # Separate step so the latency measurement has the machine to
+        # itself. Mixed into the main run it measures contention.
+        run: pytest -m perf -v

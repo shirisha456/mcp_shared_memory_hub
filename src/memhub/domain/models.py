@@ -189,13 +189,31 @@ class SearchResult:
     are 300 and you are seeing the first 10".
     """
 
-    match_strategy: Literal["all_terms", "any_term"] = "all_terms"
+    match_strategy: Literal["all_terms", "any_term", "hybrid"] = "all_terms"
     """How the query was matched.
 
-    ``all_terms`` is the strict interpretation and the default. ``any_term``
-    means the strict query found nothing and the search widened - reported rather
-    than hidden, because a caller reading loosely matched results should know
-    that is what they are.
+    ``all_terms`` is the strict lexical interpretation. ``any_term`` means the
+    strict query found nothing and the search widened. ``hybrid`` means lexical
+    and semantic rankings were fused. Reported rather than hidden, because a
+    caller reading loosely matched results should know that is what they are.
+    """
+
+    semantic_coverage: float | None = None
+    """Fraction of the project's retrievable memories that currently have a vector.
+
+    Embedding is asynchronous, so there is always a window where a memory is
+    findable by full text but not semantically. Saying so is the difference
+    between eventual consistency and silent incompleteness: a caller can tell
+    "the semantic half saw everything" apart from "the semantic half saw 60% of
+    it", and those are very different results.
+    """
+
+    degraded: str | None = None
+    """Set when part of the search could not run.
+
+    An unavailable embedder degrades hybrid retrieval to lexical rather than
+    failing the request - but the caller is told, rather than receiving a
+    quietly worse answer that looks identical to a good one.
     """
 
     def returned_count(self) -> int:

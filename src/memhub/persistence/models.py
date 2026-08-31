@@ -28,6 +28,7 @@ import datetime as dt
 import uuid
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -52,6 +53,19 @@ _SLUG_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,62}[a-z0-9]$"
 _MEMORY_TYPES = "'DECISION','CONSTRAINT','FACT','TASK'"
 _MEMORY_STATUSES = "'ACTIVE','SUPERSEDED','DELETED'"
 _AUTHOR_KINDS = "'agent','human_confirmed','import'"
+
+EMBEDDING_DIM = 384
+"""Vector width, fixed at the column.
+
+384 is BAAI/bge-small-en-v1.5, the default local model: small enough to run on
+CPU without a GPU or a torch install, and good enough that the measured gain
+over full-text is real rather than noise.
+
+pgvector requires a fixed dimension per column, so this is not a runtime setting.
+Changing it is a migration and a full re-embed, which is the honest cost of
+changing embedding model at all - vectors from different models cannot be
+compared, so there is no incremental path.
+"""
 
 
 class Project(Base):
@@ -439,4 +453,111 @@ class MemoryAttestation(Base):
             ondelete="CASCADE",
         ),
         CheckConstraint("times_seen >= 1", name="times_seen_positive"),
+    )
+
+
+class MemoryEmbedding(Base):
+    """A vector for one revision under one model.
+
+    **Its own table rather than a column on memory_revisions**, for three
+    reasons. A 384-dimension vector is ~1.5KB, and putting it inline would widen
+    the hot metadata row that every filter and join touches. Re-embedding under a
+    new model would rewrite the append-only content log, which is supposed to be
+    immutable. And the model name is part of the key, so vectors produced by
+    different models can coexist without any risk of being compared to each
+    other - which would be meaningless, since embedding spaces are not
+    commensurable.
+
+    The dimension is fixed by the column type: pgvector requires it. ``dim`` is a
+    stored assertion, not flexibility - a second model with a different width
+    needs a second table, and that is a deliberate deferral rather than an
+    oversight.
+    """
+
+    __tablename__ = "memory_embeddings"
+
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    revision_no: Mapped[int] = mapped_column(Integer, primary_key=True)
+    model: Mapped[str] = mapped_column(Text, primary_key=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    dim: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    embedding: Mapped[Any] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_id", "revision_no"],
+            ["memory_revisions.memory_id", "memory_revisions.revision_no"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(f"dim = {EMBEDDING_DIM}", name="dim_matches_column"),
+        Index("ix_memory_embeddings_project_id", "project_id"),
+        Index(
+            "ix_memory_embeddings_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+
+class EmbeddingJob(Base):
+    """The transactional outbox for embedding generation.
+
+    **Why an outbox rather than embedding inline.** Generating an embedding is
+    slow and fallible. Doing it inside the write transaction would hold the
+    ``memories`` row lock across it, so one slow inference call would block every
+    other writer on that memory - and a model being unavailable would become a
+    *write* outage: you could no longer record a decision because an embedder was
+    down. That coupling is absurd.
+
+    Doing it after the transaction instead is the classic dual-write bug: crash
+    between commit and enqueue and the memory exists forever with no vector and
+    nothing knows to fix it.
+
+    So the job row is inserted in the *same transaction* as the revision. Either
+    both exist or neither does. A worker then claims rows with
+    ``FOR UPDATE SKIP LOCKED``, which lets workers in both server processes drain
+    the queue without contending or double-processing.
+
+    The result is eventual consistency with an **explicit, queryable** pending
+    state - never silent inconsistency. ``semantic_coverage`` in every search
+    response says what fraction of the corpus is currently vector-searchable.
+    """
+
+    __tablename__ = "embedding_jobs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'PENDING'"))
+    attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
+    next_attempt_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        UniqueConstraint("memory_id", "revision_no", "model"),
+        ForeignKeyConstraint(
+            ["memory_id", "revision_no"],
+            ["memory_revisions.memory_id", "memory_revisions.revision_no"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("state IN ('PENDING','DONE','DEAD')", name="state_known"),
+        CheckConstraint("attempts >= 0", name="attempts_non_negative"),
+        # Partial: at steady state almost every row is DONE and no claim will
+        # ever look at it, so indexing them would grow the index for nothing.
+        Index(
+            "ix_embedding_jobs_next_attempt_at",
+            "next_attempt_at",
+            postgresql_where=text("state = 'PENDING'"),
+        ),
     )

@@ -71,6 +71,7 @@ async def remember(
     author_kind: AuthorKind = AuthorKind.AGENT,
     client_request_id: str | None = None,
     request_id: str | None = None,
+    embedding_model: str | None = None,
     now: dt.datetime | None = None,
 ) -> RememberResult:
     """Record a new memory, optionally retiring the ones it replaces.
@@ -186,6 +187,11 @@ async def remember(
         author_client=author_client,
         request_id=request_id,
     )
+
+    if embedding_model is not None:
+        # Same transaction as the revision. Either both exist or neither does -
+        # which is the difference between an outbox and a dual write.
+        await truth.enqueue_embedding(project_id, memory.id, revision_no=1, model=embedding_model)
 
     attestations = await truth.attest(project_id, memory.id, client_name=author_client)
 
@@ -400,6 +406,7 @@ async def revise(
     author_kind: AuthorKind = AuthorKind.AGENT,
     client_request_id: str | None = None,
     request_id: str | None = None,
+    embedding_model: str | None = None,
 ) -> ReviseResult:
     """Refine an existing memory, if nobody else changed it first.
 
@@ -438,6 +445,7 @@ async def revise(
             return ReviseReplayed(memory=replayed)
 
     repo = MemoryRepository(session)
+    truth = TruthRepository(session)
     existing = await repo.get(project_id, memory_id)
     if existing is None:
         raise MemoryNotFoundError(
@@ -482,6 +490,11 @@ async def revise(
         _METRICS.increment(m.CONFLICTS)
         return ReviseConflicted(
             current=to_view(current[0], current[1]), expected_revision=expected_revision
+        )
+
+    if embedding_model is not None:
+        await truth.enqueue_embedding(
+            project_id, memory_id, revision_no=new_revision, model=embedding_model
         )
 
     await audit.record(

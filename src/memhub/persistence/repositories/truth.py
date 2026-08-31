@@ -274,3 +274,63 @@ class TruthRepository:
             )
             for row in (await self._session.execute(stmt)).scalars()
         ]
+
+    # -- embedding outbox -------------------------------------------------
+    async def enqueue_embedding(
+        self,
+        project_id: uuid.UUID,
+        memory_id: uuid.UUID,
+        *,
+        revision_no: int,
+        model: str,
+    ) -> None:
+        """Queue a revision for embedding, in the caller's transaction.
+
+        This is what makes it an outbox rather than a dual write. The job row and
+        the revision commit together, so there is no window in which a memory
+        exists with no vector and nothing knows to produce one - and no window in
+        which a job points at a revision that was rolled back.
+
+        ``ON CONFLICT DO NOTHING`` because a revision only ever needs embedding
+        once per model, and a re-enqueue after a retry must not create a second
+        job.
+        """
+        await self._session.execute(
+            text(
+                "INSERT INTO embedding_jobs (memory_id, revision_no, project_id, model) "
+                "VALUES (:mid, :rev, :pid, :model) "
+                "ON CONFLICT (memory_id, revision_no, model) DO NOTHING"
+            ),
+            {"mid": memory_id, "rev": revision_no, "pid": project_id, "model": model},
+        )
+
+    async def semantic_coverage(self, project_id: uuid.UUID, *, model: str) -> float:
+        """Fraction of retrievable memories that currently have a vector.
+
+        Reported in every search response. Embedding is asynchronous, so there is
+        always a window where a memory is findable by full-text but not
+        semantically - and the honest thing is to say so rather than let a caller
+        assume the semantic half of a hybrid search saw everything.
+        """
+        row = (
+            await self._session.execute(
+                text(
+                    """
+                    SELECT count(*) AS total,
+                           count(e.memory_id) AS embedded
+                      FROM memories m
+                      JOIN memory_revisions r
+                        ON r.memory_id = m.id AND r.revision_no = m.current_revision_no
+                      LEFT JOIN memory_embeddings e
+                        ON e.memory_id = r.memory_id
+                       AND e.revision_no = r.revision_no
+                       AND e.model = :model
+                     WHERE m.project_id = :pid
+                       AND m.status = 'ACTIVE'
+                       AND (m.expires_at IS NULL OR m.expires_at > now())
+                    """
+                ),
+                {"pid": project_id, "model": model},
+            )
+        ).one()
+        return 1.0 if row.total == 0 else float(row.embedded) / float(row.total)

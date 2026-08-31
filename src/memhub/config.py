@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 
 Environment = Literal["local", "ci", "production"]
+EmbeddingAdapter = Literal["none", "fake", "local"]
 LogFormat = Literal["json", "text"]
 
 _REQUIRED_DRIVER = "postgresql+asyncpg"
@@ -47,6 +48,22 @@ class Settings(BaseSettings):
     away should be killed by PostgreSQL, not by an application-side race."""
 
     db_echo: bool = False
+
+    # -- embeddings --------------------------------------------------------
+    embedding_adapter: EmbeddingAdapter = "none"
+    """Which embedder to use, if any.
+
+    ``none`` is the default, so a fresh install works with no model download and
+    search is full-text only. ``local`` runs BAAI/bge-small-en-v1.5 through
+    fastembed and requires the optional extra. ``fake`` is the deterministic hash
+    embedder, which is for exercising the plumbing in tests and carries no
+    semantic signal - never set it in anything whose results matter.
+
+    Defaulting to ``none`` rather than ``local`` is deliberate: a server that
+    tries to download a model on first use is a server that fails to start on a
+    machine without a network, for a feature that is supposed to be an
+    enhancement.
+    """
 
     # -- observability -----------------------------------------------------
     log_level: str = "INFO"

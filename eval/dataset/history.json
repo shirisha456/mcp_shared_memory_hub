@@ -18,5 +18,15 @@
     "mrr": 0.8226,
     "stale_inclusion_rate": 0.0,
     "empty_for_unanswerable": 0.6667
+  },
+  {
+    "strategy": "hybrid: full-text + pgvector, fused by RRF, distance <= 0.35",
+    "note": "Beats full text on ranking and recall. The threshold is the interesting part: without one, nDCG reached 0.881 but precision collapsed to 0.113 and every unanswerable query returned ten results, because approximate nearest neighbour search returns the k closest vectors whether or not anything is close. 0.35 was chosen by sweeping against this corpus - see docs/eval/threshold-sweep.md. Hybrid is worse at recognising an unanswerable question (0.667 -> 0.333), which is the honest cost. Measured with BAAI/bge-small-en-v1.5 locally; CI runs the lexical evaluation only.",
+    "ndcg": 0.853,
+    "recall": 0.828,
+    "precision": 0.671,
+    "mrr": 0.914,
+    "stale_inclusion_rate": 0.0,
+    "empty_for_unanswerable": 0.333
   }
 ]

@@ -4,8 +4,9 @@ A persistent, versioned memory service that lets multiple MCP-compatible AI clie
 knowledge across sessions, with conflict-safe updates, provenance, hybrid retrieval, stale-memory
 handling, and context-budgeted recall.
 
-**Status: truth maintenance.** Six MCP tools over stdio, backed by PostgreSQL, with
-compare-and-set updates, idempotent writes, deduplication and stale-memory suppression. See
+**Status: hybrid retrieval.** Six MCP tools over stdio, backed by PostgreSQL, with
+compare-and-set updates, idempotent writes, deduplication, stale-memory suppression, and
+keyword + vector search fused by rank. See
 [`docs/architecture.md`](docs/architecture.md) for the full design and
 [the roadmap](docs/architecture.md#15-revised-roadmap) for what lands when.
 
@@ -137,8 +138,8 @@ seventh tool: retiring a fact and asserting its replacement are one atomic act, 
 | 4 | Claude Desktop / Cursor integration, golden manifest | done |
 | 5 | Full-text retrieval | done |
 | 6 | Evaluation harness (before vectors, deliberately) | done |
-| 7 | pgvector, embedding outbox, hybrid RRF ranking | next |
-| 8 | Context builder under a token budget | |
+| 7 | pgvector, embedding outbox, hybrid RRF ranking | done |
+| 8 | Context builder under a token budget | next |
 | 9 | Failure injection, benchmarks, `EXPLAIN ANALYZE` | |
 
 ### Concurrency
@@ -240,6 +241,65 @@ match `JWTs` (Snowball does not stem acronym plurals), "deadlock prevention" mis
 describes deadlock prevention without using the word, and "worked on right now" misses "Currently
 implementing". That is the concrete target for semantic retrieval — measured first, so the claim
 that it helps will be a number.
+
+### Hybrid retrieval
+
+Full-text and pgvector run over the same stage-0 filter and are fused by **Reciprocal Rank Fusion**
+— position, not score. `ts_rank_cd` is unbounded and corpus-dependent; cosine distance is in [0, 2].
+Adding them is meaningless, and normalising per query is worse: it scales a mediocre best match to
+1.0 exactly like a perfect one. RRF also degrades cleanly — if the outbox is behind, those documents
+simply do not appear in that ranking and contribute nothing.
+
+| Strategy | nDCG@10 | Recall@10 | Precision@10 | Stale |
+|---|---|---|---|---|
+| full text, all terms required | 0.478 | 0.468 | 0.484 | **0.000** |
+| full text, any-term fallback | 0.803 | 0.817 | 0.691 | **0.000** |
+| hybrid, RRF, distance ≤ 0.35 | **0.853** | **0.828** | 0.671 | **0.000** |
+
+The `jwt` query went from 0.000 to a perfect 1.000 — the stemmer never matched `JWTs`, and meaning
+does. `deadlock prevention` is still 0.000: the memory describes deadlock prevention without using
+the word, and 384 dimensions of a small model do not bridge that.
+
+**The threshold is the part worth reading about.** Without one, hybrid scored nDCG 0.881 — and
+precision collapsed to **0.113**, with every unanswerable query returning ten results. Approximate
+nearest neighbour search returns the *k* closest vectors whether or not anything is close. 0.35 was
+chosen by sweeping against the corpus; the full table and what it costs are in
+[`docs/eval/threshold-sweep.md`](docs/eval/threshold-sweep.md). Reporting the 0.881 and stopping
+would have been true and badly misleading.
+
+### Embedding is asynchronous, by a transactional outbox
+
+Generating a vector inline would hold the `memories` row lock across a slow, fallible call — so one
+slow inference blocks every other writer, and a model being down becomes a *write* outage. Enqueuing
+after the transaction is the classic dual-write bug: crash between commit and enqueue and the memory
+exists forever with no vector and nothing knows.
+
+So the job row is inserted **in the same transaction as the revision** — both exist or neither does.
+A worker claims batches with `FOR UPDATE SKIP LOCKED`, which is what lets a worker in each client's
+server process drain one queue without contending. There's a test asserting four concurrent workers
+process exactly 40 jobs between them.
+
+The result is eventual consistency with an **explicit, queryable** pending state. Every search
+response carries `semantic_coverage`, so a caller can tell "the semantic half saw everything" from
+"it saw 60%". Failures back off exponentially and end as `DEAD` with the reason recorded — never a
+silent hole in the index.
+
+This project uses PostgreSQL as a durable job queue, which is the architectural decision used as the
+running example throughout its own documentation, and the reason Redis is not a dependency.
+
+### Running it with semantic search
+
+```bash
+pip install -e ".[local-embeddings]"
+```
+
+Then set `MEMHUB_EMBEDDING_ADAPTER=local`. Defaults to `none`, so a fresh install works with no model
+download and search is full-text only — a server that downloads a model on first use is a server
+that fails to start without a network, for a feature meant to be an enhancement.
+
+CI uses a deterministic hash embedder that carries **no semantic signal**. It exists to exercise the
+outbox, the vector column, fusion and coverage reporting hermetically. It cannot measure quality, and
+the harness does not let it try: the numbers above come from `BAAI/bge-small-en-v1.5` run locally.
 
 ### What is deliberately not built yet
 

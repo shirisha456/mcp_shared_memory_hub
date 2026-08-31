@@ -27,10 +27,13 @@ the same judgments. The judgments were written before any of them ran.
 |---|---|---|---|---|
 | full-text, all terms required (ts_rank_cd + priors) | 0.478 | 0.468 | 0.484 | 0.000 |
 | full-text, any-term fallback when the strict query finds nothing | 0.802 | 0.817 | 0.691 | 0.000 |
+| hybrid: full-text + pgvector, fused by RRF, distance <= 0.35 | 0.853 | 0.828 | 0.671 | 0.000 |
 
 **full-text, all terms required (ts_rank_cd + priors)** - PostgreSQL joins bare query terms with AND, so a natural-language question needs every word present. 'migration rules' and 'connection pool size' returned nothing at all.
 
 **full-text, any-term fallback when the strict query finds nothing** - Precision is preserved for queries that match strictly; the widening only happens when the alternative is returning nothing. Stale inclusion stayed at exactly zero, which is the useful part: loosening the match did not loosen the correctness guarantee, because suppression is structural rather than a ranking effect.
+
+**hybrid: full-text + pgvector, fused by RRF, distance <= 0.35** - Beats full text on ranking and recall. The threshold is the interesting part: without one, nDCG reached 0.881 but precision collapsed to 0.113 and every unanswerable query returned ten results, because approximate nearest neighbour search returns the k closest vectors whether or not anything is close. 0.35 was chosen by sweeping against this corpus - see docs/eval/threshold-sweep.md. Hybrid is worse at recognising an unanswerable question (0.667 -> 0.333), which is the honest cost. Measured with BAAI/bge-small-en-v1.5 locally; CI runs the lexical evaluation only.
 
 ## Weakest queries
 

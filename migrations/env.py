@@ -35,6 +35,19 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def _render_item(type_: str, obj: object, autogen_context: object) -> str | bool:
+    """Emit the right import for third-party column types.
+
+    Autogenerate renders a pgvector column as ``pgvector.sqlalchemy.Vector(384)``
+    but does not add the import, so the generated migration raises NameError the
+    first time it runs. Registering the import here fixes it for every future
+    migration rather than one at a time.
+    """
+    if type_ == "type" and obj.__class__.__module__.startswith("pgvector"):
+        autogen_context.imports.add("import pgvector.sqlalchemy")  # type: ignore[attr-defined]
+    return False
+
+
 def _database_url() -> str:
     injected = config.attributes.get("db_url")
     if injected:
@@ -55,6 +68,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         compare_server_default=True,
+        render_item=_render_item,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -66,6 +80,7 @@ def _do_run_migrations(connection: Connection) -> None:
         target_metadata=target_metadata,
         compare_type=True,
         compare_server_default=True,
+        render_item=_render_item,
     )
     with context.begin_transaction():
         context.run_migrations()

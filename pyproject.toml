@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
     "mcp>=2.1.1",
+    "pgvector>=0.3.0",
 ]
 
 # mcp 2.1.1 verified against PyPI at Milestone 1, not assumed: v2 renamed
@@ -26,6 +27,12 @@ dependencies = [
 memhub-server = "memhub.mcp.__main__:main"
 
 [project.optional-dependencies]
+local-embeddings = [
+    # ONNX runtime rather than torch: a ~50MB model and no 2GB dependency tree.
+    # Optional because CI uses the deterministic fake, and a base install of this
+    # server has no reason to carry an inference runtime.
+    "fastembed>=0.8.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -108,13 +115,24 @@ asyncio_mode = "auto"
 # the code under test.
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
-addopts = "-ra --strict-markers --strict-config"
+# Benchmarks and real-model evaluation are deselected by default.
+#
+# The latency benchmark measures a query; running it alongside 280 other
+# tests measures contention with them instead, and produced a p95 that
+# failed in the full suite and passed in isolation. A benchmark that shares
+# a machine with the rest of the suite is not measuring what it claims.
+#
+# Run them explicitly:
+#   pytest -m perf
+#   pytest -m real_embeddings     (needs the local-embeddings extra)
+addopts = "-ra --strict-markers --strict-config -m 'not perf and not real_embeddings'"
 markers = [
     "integration: requires a real PostgreSQL instance",
     "concurrency: exercises real concurrent database access",
     "stdio: spawns the server as a subprocess and talks over real stdio",
     "perf: seeds a large corpus and measures latency",
     "eval: measures retrieval quality against a graded corpus",
+    "real_embeddings: needs a real local embedding model, not the deterministic fake",
 ]
 filterwarnings = [
     "error",

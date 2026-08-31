@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from memhub.domain.enums import AuthorKind, MemoryType
 from memhub.domain.errors import ValidationFailedError
+from memhub.embeddings.base import EmbeddingPort
 from memhub.mcp.mapping import domain_errors
 from memhub.mcp.schemas import (
     ForgetOut,
@@ -53,6 +54,7 @@ from memhub.persistence.models import Memory
 from memhub.persistence.repositories.projects import ProjectRepository
 from memhub.services import memories as memory_service
 from memhub.services import projects as project_service
+from memhub.services import retrieval as retrieval_service
 
 SERVER_INSTRUCTIONS = """\
 Shared, versioned project memory for MCP clients.
@@ -92,6 +94,7 @@ def build_server(
     *,
     name: str = "memhub",
     version: str = "0.1.0",
+    embedder: EmbeddingPort | None = None,
 ) -> MCPServer:
     """Construct the server bound to a session factory.
 
@@ -258,6 +261,7 @@ def build_server(
                     [_parse_uuid(m, "supersedes") for m in supersedes] if supersedes else None
                 ),
                 client_request_id=client_request_id,
+                embedding_model=embedder.model_name if embedder else None,
             )
             return RememberOut.of(result)
 
@@ -317,6 +321,7 @@ def build_server(
                 change_reason=change_reason,
                 author_client=client,
                 client_request_id=client_request_id,
+                embedding_model=embedder.model_name if embedder else None,
             )
             return ReviseOut.of(result)
 
@@ -349,14 +354,32 @@ def build_server(
         limit: Annotated[int, Field(description="Maximum results, 1-100.", ge=1, le=100)] = 10,
     ) -> SearchOut:
         async with session_scope(session_factory) as session:
-            result = await memory_service.search(
-                session,
-                _parse_uuid(project_id, "project_id"),
-                query=query,
-                types=[_parse_type(t) for t in types] if types else None,
-                tags=tags,
-                limit=limit,
-            )
+            parsed_project = _parse_uuid(project_id, "project_id")
+            parsed_types = [_parse_type(t) for t in types] if types else None
+
+            # Hybrid only when there is both a query to embed and an embedder to
+            # embed it with. Browsing without a query has nothing to be similar
+            # to, and an unconfigured embedder means full-text is the whole
+            # search rather than half of a broken one.
+            if embedder is not None and query:
+                result = await retrieval_service.hybrid_search(
+                    session,
+                    parsed_project,
+                    query=query,
+                    embedder=embedder,
+                    types=parsed_types,
+                    tags=tags,
+                    limit=limit,
+                )
+            else:
+                result = await memory_service.search(
+                    session,
+                    parsed_project,
+                    query=query,
+                    types=parsed_types,
+                    tags=tags,
+                    limit=limit,
+                )
             return SearchOut.of(result)
 
     @server.tool(
