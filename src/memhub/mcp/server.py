@@ -26,12 +26,14 @@ about.
 # right module globals, which breaks as soon as a handler is wrapped by a
 # decorator defined elsewhere.
 
+import json
 import uuid
 from typing import Annotated
 
 from mcp.server import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError
 from pydantic import Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from memhub.domain.enums import AuthorKind, MemoryType
@@ -47,6 +49,8 @@ from memhub.mcp.schemas import (
     SearchOut,
 )
 from memhub.persistence.engine import session_scope
+from memhub.persistence.models import Memory
+from memhub.persistence.repositories.projects import ProjectRepository
 from memhub.services import memories as memory_service
 from memhub.services import projects as project_service
 
@@ -421,6 +425,48 @@ def build_server(
             return HistoryOut.of(record)
 
     @server.resource(
+        "memory://projects",
+        name="projects",
+        title="Known projects",
+        description=(
+            "Every project namespace on this server. Read-only, identity-addressed "
+            "and cacheable, which is why it is a resource rather than a tool."
+        ),
+        mime_type="application/json",
+    )
+    async def list_projects() -> str:
+        async with session_scope(session_factory) as session:
+            projects = await ProjectRepository(session).list_all()
+            return json.dumps(
+                [
+                    {
+                        "project_id": str(p.id),
+                        "slug": p.slug,
+                        "display_name": p.display_name,
+                    }
+                    for p in projects
+                ],
+                indent=2,
+            )
+
+    @server.resource(
+        "memory://memories/{memory_id}/history",
+        name="memory-history",
+        title="A memory's full record",
+        description=(
+            "Revisions, supersession lineage, attestations and audit trail for one "
+            "memory - including retired ones that search deliberately hides."
+        ),
+        mime_type="application/json",
+    )
+    async def read_memory_history(memory_id: str) -> str:
+        parsed = _parse_uuid(memory_id, "memory_id")
+        async with session_scope(session_factory) as session:
+            owner = await _owning_project(session, parsed)
+            record = await memory_service.history(session, owner, parsed)
+            return HistoryOut.of(record).model_dump_json(indent=2)
+
+    @server.resource(
         "memory://memories/{memory_id}",
         name="memory",
         title="A single memory",
@@ -433,22 +479,31 @@ def build_server(
     async def read_memory(memory_id: str) -> str:
         parsed = _parse_uuid(memory_id, "memory_id")
         async with session_scope(session_factory) as session:
-            # Resource URIs carry no project, so the memory is looked up by id and
-            # its own project is used for the scope check. A caller still cannot
-            # read across projects, because the id itself is unguessable and the
-            # lookup re-checks project membership.
-            from sqlalchemy import select
-
-            from memhub.persistence.models import Memory
-
-            owner = (
-                await session.execute(select(Memory.project_id).where(Memory.id == parsed))
-            ).scalar_one_or_none()
-            if owner is None:
-                raise ToolError(f"[MEMORY_NOT_FOUND] No memory with id {memory_id}.")
+            owner = await _owning_project(session, parsed)
             view = await memory_service.get_memory(session, owner, parsed)
             if view is None:
-                raise ToolError(f"[MEMORY_NOT_FOUND] No memory with id {memory_id}.")
+                raise ResourceNotFoundError(f"No active memory with id {memory_id}.")
             return MemoryOut.of(view).model_dump_json(indent=2)
 
     return server
+
+
+async def _owning_project(session: AsyncSession, memory_id: uuid.UUID) -> uuid.UUID:
+    """Resolve which project a memory belongs to.
+
+    Resource URIs carry no project, unlike every tool. That is safe here for two
+    reasons: a memory id is an unguessable UUID, and the project it resolves to
+    is then used as the scope for the actual read - so a caller still cannot
+    reach across a project boundary, they can only read a memory whose id they
+    already hold.
+
+    Raising ``ResourceNotFoundError`` rather than ``ToolError``: a missing
+    resource is a ``-32602`` protocol error, which is the correct shape for a
+    URI that does not resolve. ``ToolError`` belongs to tool calls.
+    """
+    owner = (
+        await session.execute(select(Memory.project_id).where(Memory.id == memory_id))
+    ).scalar_one_or_none()
+    if owner is None:
+        raise ResourceNotFoundError(f"No memory with id {memory_id}.")
+    return uuid.UUID(str(owner))

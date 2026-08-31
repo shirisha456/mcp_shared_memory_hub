@@ -696,3 +696,80 @@ class TestTruthMaintenanceOverTheProtocol:
         assert forget_tool.description is not None
         assert "forgetting is not enough" in forget_tool.description
         assert "operator purge" in forget_tool.description
+
+
+class TestReadOnlyResources:
+    """Resources are the identity-addressed, side-effect-free half of the surface.
+
+    A tool takes a query the model composes; a resource has a stable URI the host
+    can attach without spending a model turn. That is the whole distinction, and
+    it is why search is a tool while "this specific memory" is a resource.
+    """
+
+    async def test_projects_resource_lists_namespaces(self, server: MCPServer) -> None:
+        async with Client(server) as client:
+            await make_project(client, "resource-list-a")
+            await make_project(client, "resource-list-b")
+            read = await client.read_resource("memory://projects")
+
+        contents = read.contents[0]
+        assert isinstance(contents, TextResourceContents)
+        slugs = {p["slug"] for p in json.loads(contents.text)}
+        assert {"resource-list-a", "resource-list-b"} <= slugs
+
+    async def test_history_resource_shows_retired_memories(self, server: MCPServer) -> None:
+        """The resource has to reach what search deliberately hides.
+
+        Otherwise a retired memory would be unreachable by any read path, and
+        suppression would have quietly become deletion.
+        """
+        async with Client(server) as client:
+            pid = await make_project(client, "resource-history")
+            old = ok(
+                await client.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "FACT",
+                        "content": "Redis is the queue.",
+                        "client": "claude-desktop",
+                    },
+                )
+            )
+            old_id = old["memory"]["memory_id"]
+            ok(
+                await client.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "DECISION",
+                        "content": "PostgreSQL is the queue.",
+                        "supersedes": [old_id],
+                        "client": "cursor",
+                    },
+                )
+            )
+            read = await client.read_resource(f"memory://memories/{old_id}/history")
+
+        contents = read.contents[0]
+        assert isinstance(contents, TextResourceContents)
+        body = json.loads(contents.text)
+        assert body["status"] == "SUPERSEDED"
+        assert body["superseded_by"]["content"] == "PostgreSQL is the queue."
+        assert body["revisions"][0]["author_client"] == "claude-desktop"
+
+    async def test_unknown_memory_uri_is_a_protocol_error(self, server: MCPServer) -> None:
+        """A URI that does not resolve is -32602, not a tool error.
+
+        Tool errors belong to tool calls; a missing resource is a bad request for
+        a resource, and the distinction is what lets a client tell "this tool
+        refused" apart from "this address is wrong".
+        """
+        async with Client(server) as client:
+            with pytest.raises(Exception, match=r"(?i)no memory with id"):
+                await client.read_resource("memory://memories/00000000-0000-4000-8000-000000000000")
+
+    async def test_malformed_uuid_in_a_uri_is_rejected(self, server: MCPServer) -> None:
+        async with Client(server) as client:
+            with pytest.raises(Exception, match=r"(?i)uuid|not found|invalid"):
+                await client.read_resource("memory://memories/not-a-uuid")

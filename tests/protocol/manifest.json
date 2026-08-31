@@ -1,0 +1,118 @@
+{
+  "instructions": "Shared, versioned project memory for MCP clients.\n\nThis server stores knowledge you explicitly record. It cannot see conversations - it only ever receives the arguments of the tool calls you make to it.\n\nRecord a memory when the user establishes something durable: an architectural decision and what it rules out, a constraint the project must respect, a load-bearing fact, or the piece of work currently in progress. Do not record conversational chatter, and never record credentials.\n\nBefore answering questions about how a project works, search memory first: another client may have recorded the answer in an earlier session.",
+  "tools": [
+    {
+      "name": "memory_forget",
+      "title": "Retire a memory",
+      "description": "Stop a memory appearing in search, because it is no longer relevant or should not have been recorded.\n\nThis tombstones, it does not destroy. Every revision stays readable through memory_history, so the record of what the project once believed survives. Calling it twice is harmless.\n\nUse this when a fact has simply stopped mattering. If it was replaced by a *different* fact, record the new one with supersedes instead - that keeps the connection between old and new, which forgetting loses.\n\nIf a credential was recorded by mistake, forgetting is not enough: it hides the content but does not erase it. Tell the user to run the operator purge command. Permanent erasure is deliberately not available through this interface.",
+      "input_properties": [
+        "client",
+        "memory_id",
+        "project_id",
+        "reason"
+      ],
+      "required": [
+        "memory_id",
+        "project_id"
+      ],
+      "has_output_schema": true
+    },
+    {
+      "name": "memory_history",
+      "title": "Inspect a memory's full record",
+      "description": "Show everything known about one memory, including memories that search deliberately hides.\n\nReturns every revision in order, which memory replaced this one (or which ones it replaced), which clients independently asserted it, and a recent audit trail.\n\nUse it to answer 'why does the project do it this way now?' or 'what did we believe before?'. Retired memories remain fully readable here - they leave retrieval, never the record - so this is how you explain a change rather than merely observe it.",
+      "input_properties": [
+        "memory_id",
+        "project_id"
+      ],
+      "required": [
+        "memory_id",
+        "project_id"
+      ],
+      "has_output_schema": true
+    },
+    {
+      "name": "memory_remember",
+      "title": "Record a project memory",
+      "description": "Record one durable piece of project knowledge so other clients and later sessions can retrieve it.\n\nChoose the type by behaviour, not by topic:\n- DECISION: a choice that was made. State the rejected alternative INSIDE the decision text - never store 'Redis was considered' as a separate memory, because a standalone fact can later be retrieved as though it were current.\n- CONSTRAINT: a rule the project must not violate.\n- FACT: a durable statement about the project.\n- TASK: short-lived working state ('currently implementing X'). Expires automatically within 30 days. Not an issue tracker.\n\nRecord one self-contained statement per call - something that will still make sense to a different client in a month with no other context. Do not record conversational chatter.\n\nWhen a decision REPLACES an earlier one, pass the old memory's id in supersedes. The old fact stops appearing in search immediately, in the same transaction, so no client can ever see both as simultaneously true. It stays readable through memory_history. Do not instead record a new memory saying 'X is no longer true' - that leaves the original in circulation and adds a second thing to contradict it.\n\nIf another client already recorded the same fact, you get that memory back with outcome='deduplicated' and your assertion is recorded as corroboration. That is a success, not a failure.\n\nNEVER record credentials, API keys, tokens, private keys or .env contents. This is not a secret store.",
+      "input_properties": [
+        "client",
+        "client_request_id",
+        "content",
+        "human_confirmed",
+        "importance",
+        "project_id",
+        "source",
+        "supersedes",
+        "tags",
+        "type"
+      ],
+      "required": [
+        "content",
+        "project_id",
+        "type"
+      ],
+      "has_output_schema": true
+    },
+    {
+      "name": "memory_revise",
+      "title": "Update an existing memory",
+      "description": "Change the content of a memory you have already read.\n\nYou must pass expected_revision - the revision_no you saw when you read it. If another client has changed the memory since then, your write is refused and you get back their version instead, with the revision number to retry with. This is not an error: it means someone else got there first and you would otherwise have silently erased their change.\n\nOn a conflict, read the returned content, merge your change into it, and call again with the new expected_revision. Do not simply resend your original text.\n\nUse this to refine a fact that is still the same fact. If the fact has been replaced by a different one, that is supersession, not revision - support for it arrives in a later version.\n\nPass client_request_id (any unique string, a UUID is ideal) so that retrying after a dropped connection replays the original result rather than reporting a confusing conflict against yourself.",
+      "input_properties": [
+        "change_reason",
+        "client",
+        "client_request_id",
+        "content",
+        "expected_revision",
+        "memory_id",
+        "project_id",
+        "tags"
+      ],
+      "required": [
+        "content",
+        "expected_revision",
+        "memory_id",
+        "project_id"
+      ],
+      "has_output_schema": true
+    },
+    {
+      "name": "memory_search",
+      "title": "Search project memory",
+      "description": "Retrieve memories recorded for a project, by any client, in any earlier session.\n\nSuperseded, deleted and expired memories are never returned. What you get back is what is currently true, not everything that was ever said - so you can rely on a result without checking whether it has since been replaced.\n\nFilter by type and tags to narrow the set. The optional query is a substring match today; relevance ranking arrives in a later version.",
+      "input_properties": [
+        "limit",
+        "project_id",
+        "query",
+        "tags",
+        "types"
+      ],
+      "required": [
+        "project_id"
+      ],
+      "has_output_schema": true
+    },
+    {
+      "name": "project_use",
+      "title": "Resolve or create a project",
+      "description": "Resolve the project namespace that memories belong to, and return its canonical project_id for use with the other tools.\n\nPass whatever you know: a slug, the repository's git remote, or the workspace path. Hints are resolved independently and must agree; if they point at different projects you get an error listing them rather than a guess.\n\nProjects are never created implicitly. If nothing matches you get an error, and creating one requires create=true with an explicit slug. This is deliberate: a client opened in the wrong directory would otherwise silently start a second, empty memory namespace and split the project's knowledge in half.",
+      "input_properties": [
+        "create",
+        "display_name",
+        "git_remote",
+        "project_id",
+        "slug",
+        "workspace_path"
+      ],
+      "required": [],
+      "has_output_schema": true
+    }
+  ],
+  "resource_templates": [
+    "memory://memories/{memory_id}",
+    "memory://memories/{memory_id}/history"
+  ],
+  "resources": [
+    "memory://projects"
+  ]
+}

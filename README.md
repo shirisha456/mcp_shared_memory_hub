@@ -73,20 +73,29 @@ see [`.env.example`](.env.example).
 
 ## Connecting a client
 
-Add to your MCP client configuration (Claude Desktop, Cursor):
+Full setup for both clients, with verified config formats and troubleshooting, is in
+[docs/clients.md](docs/clients.md). The short version — note the **absolute path**, since neither
+client runs the server from your project directory and Cursor's config has no `cwd` field:
 
 ```json
 {
   "mcpServers": {
     "memhub": {
-      "command": "memhub-server",
-      "env": { "MEMHUB_DATABASE_URL": "postgresql+asyncpg://memhub:memhub@localhost:5435/memhub" }
+      "command": "C:\\Users\\you\\mcp_shared_memory_hub\\.venv\\Scripts\\memhub-server.exe",
+      "env": {
+        "MEMHUB_DATABASE_URL": "postgresql+asyncpg://memhub:memhub@localhost:5435/memhub"
+      }
     }
   }
 }
 ```
 
-Each client spawns its **own** server process. They share nothing but PostgreSQL.
+Claude Desktop reads `%APPDATA%\Claude\claude_desktop_config.json`; Cursor reads
+`~/.cursor/mcp.json` or `.cursor/mcp.json`, and additionally wants `"type": "stdio"`.
+
+Point both at the **same** `MEMHUB_DATABASE_URL`. Each client spawns its own server process, and
+those processes share nothing else — no memory, no cache, no files. Different URLs and everything
+still appears to work while each client quietly keeps a private corpus.
 
 ## Tool surface
 
@@ -99,7 +108,19 @@ Each client spawns its **own** server process. They share nothing but PostgreSQL
 | `memory_search` | Retrieve active memories. Superseded, deleted and expired are never returned. |
 | `memory_history` | Full record for one memory, including retired ones: revisions, lineage, attestations, audit. |
 
-Plus one read-only resource, `memory://memories/{memory_id}`.
+Plus three read-only resources — identity-addressed and side-effect free, which is what makes them
+resources rather than tools:
+
+```
+memory://projects                        every project namespace
+memory://memories/{memory_id}            one memory at its current revision
+memory://memories/{memory_id}/history    full record, including retired memories
+```
+
+The tool manifest — names, titles, descriptions, schemas — is snapshotted to
+[`tests/protocol/manifest.json`](tests/protocol/manifest.json) and asserted on every run. Tool
+descriptions are the prompt that steers the model, so a wording change alters behaviour with no
+logic change; the snapshot makes that show up in review as a diff.
 
 `memory_context` arrives with the context-budget milestone. Supersession is deliberately not a
 seventh tool: retiring a fact and asserting its replacement are one atomic act, so
@@ -113,8 +134,8 @@ seventh tool: retiring a fact and asserting its replacement are one atomic act, 
 | 1 | Projects, memories, immutable revisions, 3 MCP tools over stdio | done |
 | 2 | Compare-and-set revise, idempotency, audit log, metrics | done |
 | 3 | Deduplication, attestations, supersession, forget, history | done |
-| 4 | Claude Desktop / Cursor integration, golden manifest | next |
-| 5 | Full-text retrieval | |
+| 4 | Claude Desktop / Cursor integration, golden manifest | done |
+| 5 | Full-text retrieval | next |
 | 6 | Evaluation harness (before vectors, deliberately) | |
 | 7 | pgvector, embedding outbox, hybrid RRF ranking | |
 | 8 | Context builder under a token budget | |
