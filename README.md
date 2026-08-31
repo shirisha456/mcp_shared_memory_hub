@@ -17,10 +17,12 @@ third time.
 
 So you write the decision down in a markdown file and point both tools at it. That works.
 
-**Six months later.** Redis is gone. PostgreSQL's `SKIP LOCKED` now does the same job, and it does
-so with one fewer service to run and with transactions included. The code changed; the file did not.
-The assistant reads that file, reports that the queue runs on Redis, and states it with exactly the
-confidence it brings to everything else.
+**Six months later.** You have replaced Redis with PostgreSQL, which was already running and can do
+the same job with one fewer service to keep alive. You update the code. Nobody remembers the file.
+
+So the assistant reads that file and tells you the queue runs on Redis. It is wrong, and it sounds
+exactly as certain as it does when it is right. That is what makes it expensive: nothing marks the
+answer as out of date, so you have no reason to double-check it.
 
 Three separate failures, and only one of them is hard:
 
