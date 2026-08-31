@@ -75,6 +75,49 @@ I am choosing PostgreSQL anyway, for reasons I will state plainly rather than dr
 
 That is the honest trade: paying operational complexity to buy a substrate where the interesting invariants are *expressible and testable*. That framing is worth more in an interview than "Postgres because it scales".
 
+**Why not markdown files in the project repo, synced by git?** — the cheapest
+alternative of all, and the one most likely to be raised, because it needs no
+database, no Docker and no server. Memories become `.md` files under
+`memory/`, they are human-readable, they diff in a pull request, and `git push`
+shares them between machines and teammates. Existing MCP memory servers work
+exactly this way. This deserves a real answer rather than a dismissal, and the
+answer is that git solves *distribution* while leaving both of this project's
+actual problems untouched.
+
+*Git has the wrong conflict model.* Two clients editing the same fact produce a
+three-way text merge. Either the merge succeeds and the file now contains two
+contradictory sentences side by side, or it fails and a human is handed conflict
+markers. Neither outcome answers the question that matters — **which of these two
+statements is currently true?** — because that is a semantic question and a text
+merge is a syntactic operation. A compare-and-set on a revision number answers it
+exactly: one writer wins, the other is told it lost and shown the current value.
+And git only adjudicates at *push* time, whereas the damage happens at *write*
+time: two clients can hold divergent working copies for hours, both believing
+they are current.
+
+*Git cannot filter at read time.* This is the more serious gap. Once "Redis is
+the queue" stops being true, it stays in the file until a human notices and
+deletes it — and until then, every retrieval returns it as a live fact. Git
+records that the line was once written; it has no notion of a statement being
+*retired*. Our stage-0 filter (§7.1) makes retirement structural: a superseded
+memory disappears from retrieval the moment it is superseded, at every context
+budget, while remaining fully visible in `memory_history`. File-based storage can
+only approximate this by deleting the text, which destroys the history, or by
+keeping it, which poisons retrieval.
+
+*Two smaller consequences.* There is no ranking or context budget over a
+directory of files - the client either reads all of them or greps them, so the
+"give me the most useful 2000 tokens" problem (§8) cannot be posed. And project
+identity becomes the directory the client happens to be pointed at, which is the
+mis-resolution §4.1 exists to prevent.
+
+What git genuinely does better, and we should not pretend otherwise: the storage
+is human-readable and reviewable, teammates share memories through a workflow
+they already have, and there is no infrastructure to run. Those are real
+advantages for a small team that wants a shared scratchpad. They are not
+advantages for a system whose job is to keep a contradictory corpus correct under
+concurrent writers - and that job is this project.
+
 ---
 
 ## 2. System boundary
@@ -1308,3 +1351,10 @@ database access and must not serialize through a small connection pool.
 **Change policy.** This document is closed to expansion. It changes only when implementation
 surfaces a decision it genuinely does not cover — and such a change is a small, dated amendment,
 not a new section.
+
+### Amendments
+
+| When | Section | Change |
+|---|---|---|
+| Milestone 1 | §3.4(a) | The v2 SDK's `ToolError` carries a message string only, so "`isError: true` with a structured payload" is not expressible. Revision conflicts will return `outcome: "conflict"` as an ordinary structured result instead. |
+| Milestone 1 | §1.3 | Added a rebuttal of *markdown files in the repo, synced by git*. Prompted by reviewing an existing public MCP memory server built exactly that way — it was the cheapest alternative to this design and the one most likely to be raised, and §1.3 had no answer to it. |
