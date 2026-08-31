@@ -2,44 +2,46 @@
 
 **An MCP server that gives AI coding assistants a shared, persistent memory of your project.**
 
-Claude Desktop, Cursor, and any other MCP client read and write one PostgreSQL-backed store. What
-you tell one assistant survives the end of the session and is there for the next one — and when a
-decision is reversed, the old one stops being returned at all.
+Claude Desktop, Cursor, and any other MCP client read from and write to a single PostgreSQL-backed
+store. What you tell one assistant outlives the session and is available to the next one. When a
+decision is reversed, the superseded version stops being returned.
 
 ## The problem
 
 **Monday.** You spend twenty minutes explaining to an AI assistant why the background job queue
-should be Redis. It follows the reasoning and writes good code.
+should run on Redis. It follows the reasoning and writes good code.
 
-**Tuesday.** New session. The assistant remembers none of it, so you explain it again. Later you
-open Cursor instead of Claude Desktop, which never saw either conversation, and explain it a third
-time.
+**Tuesday.** A new session begins, and the assistant remembers none of it, so you explain the
+decision again. Later you switch to Cursor, which never saw either conversation, and explain it a
+third time.
 
 So you write the decision down in a markdown file and point both tools at it. That works.
 
-**Six months later.** You have since dropped Redis — PostgreSQL `SKIP LOCKED` does the same job with
-one less service to run and transactions for free. The code changed. The file did not. The assistant
-reads it, tells you your queue is Redis, and it sounds exactly as authoritative as everything else
-it says.
+**Six months later.** Redis is gone. PostgreSQL's `SKIP LOCKED` now does the same job, and it does
+so with one fewer service to run and with transactions included. The code changed; the file did not.
+The assistant reads that file, reports that the queue runs on Redis, and states it with exactly the
+confidence it brings to everything else.
 
 Three separate failures, and only one of them is hard:
 
 - **Amnesia.** What you explained lives in a transcript that dies with the session.
-- **Fragmentation.** Each client keeps its own memory, or none, and they never meet.
-- **Staleness.** Written-down knowledge rots. Nothing retracts a decision once it is reversed, so
-  the model repeats it with total confidence — and a confidently wrong answer is worse than no
-  answer, because you stop checking.
+- **Fragmentation.** Each client keeps its own memory, if it keeps one at all, and those memories
+  never meet.
+- **Staleness.** Written knowledge rots. Nothing retracts a decision once it has been reversed, so
+  the model repeats it with full confidence — and a confidently wrong answer is worse than no
+  answer, because it stops you from checking.
 
-Storing facts is easy. *Retiring* them — so that a reversed decision can never surface again, no
-matter how someone searches for it — is a data-modelling and retrieval problem. Most of this
-repository is about that third bullet.
+Storing facts is easy. Retiring them is not. Guaranteeing that a reversed decision can never surface
+again, however someone searches for it, is a problem of data modelling and retrieval, and that third
+failure is what most of this repository addresses.
 
 ## What it does
 
-Conflict-safe updates, immutable revision history with supersession, hybrid keyword + vector
-retrieval, and recall that fits inside a token budget the caller specifies.
+The server provides conflict-safe updates, immutable revision history with supersession, hybrid
+keyword and vector retrieval, and recall that fits within a token budget the caller specifies.
 
-Measured rather than asserted — a hand-graded dataset of 34 queries, re-scored on every change:
+Retrieval quality is measured rather than asserted, against a hand-graded dataset of 34 queries that
+is re-scored on every change:
 
 | Retrieval strategy | nDCG@10 | Stale memories returned |
 |---|---|---|
@@ -47,15 +49,15 @@ Measured rather than asserted — a hand-graded dataset of 34 queries, re-scored
 | Full-text with any-term fallback | 0.803 | 0.000 |
 | Hybrid: full-text + pgvector, fused by RRF | **0.853** | **0.000** |
 
-That last column is the point. A retired memory reached a caller **zero** times — at every token
-budget, for every query, through two complete rewrites of the retrieval layer — because suppression
-lives in a filter that every retrieval path is built on, rather than in ranking, where a high enough
-score could always outvote it.
+The last column matters more than the first. A retired memory reached a caller **zero** times, at
+every token budget and for every query, across two complete rewrites of the retrieval layer. It held
+because suppression happens in a filter that sits beneath every retrieval path, rather than in
+ranking, where a high enough score could outvote it.
 
 **Status: complete through failure handling and scaling.** Seven MCP tools over stdio, backed by
-PostgreSQL, 369 tests. See [`docs/architecture.md`](docs/architecture.md) for the full design and
-[`docs/failure-modes.md`](docs/failure-modes.md) for every failure the design claims to handle,
-mapped to the test that holds it up.
+PostgreSQL, and 369 tests. See [`docs/architecture.md`](docs/architecture.md) for the full design,
+and [`docs/failure-modes.md`](docs/failure-modes.md) for every failure the design claims to handle,
+each mapped to the test that holds it up.
 
 ---
 
