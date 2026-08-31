@@ -39,5 +39,8 @@ def load(name: str) -> TextClause:
 
 
 CAS_REVISE = "cas_revise"
+CAS_SUPERSEDE = "cas_supersede"
+CAS_FORGET = "cas_forget"
+CLAIM_DEDUP_KEY = "claim_dedup_key"
 CLAIM_IDEMPOTENCY = "claim_idempotency"
 WAIT_IDEMPOTENCY = "wait_idempotency"

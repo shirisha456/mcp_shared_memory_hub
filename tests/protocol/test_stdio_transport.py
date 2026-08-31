@@ -138,5 +138,7 @@ async def test_stdout_carries_only_protocol_traffic(database_url: str) -> None:
         "project_use",
         "memory_remember",
         "memory_revise",
+        "memory_forget",
         "memory_search",
+        "memory_history",
     }

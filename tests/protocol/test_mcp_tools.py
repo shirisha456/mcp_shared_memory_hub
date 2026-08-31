@@ -33,7 +33,14 @@ from memhub.persistence.engine import create_session_factory
 
 pytestmark = pytest.mark.integration
 
-EXPECTED_TOOLS = {"project_use", "memory_remember", "memory_revise", "memory_search"}
+EXPECTED_TOOLS = {
+    "project_use",
+    "memory_remember",
+    "memory_revise",
+    "memory_forget",
+    "memory_search",
+    "memory_history",
+}
 
 
 @pytest.fixture
@@ -476,3 +483,216 @@ class TestReviseOverTheProtocol:
             )
 
         assert "IDEMPOTENCY_KEY_REUSED" in error_text(result)
+
+
+class TestTruthMaintenanceOverTheProtocol:
+    """The stale-memory demo, driven through MCP rather than the service layer."""
+
+    async def test_superseded_memory_disappears_from_search_but_not_history(
+        self, server: MCPServer
+    ) -> None:
+        """The flagship demo, end to end.
+
+        Claude Desktop records that Redis is the queue. Cursor later records that
+        PostgreSQL is, superseding it. A search for "queue" returns only the
+        current answer - and history still explains what changed and who changed
+        it.
+        """
+        async with Client(server) as claude:
+            pid = await make_project(claude, "stale-memory-demo")
+            old = ok(
+                await claude.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "FACT",
+                        "content": "Redis is the task queue.",
+                        "client": "claude-desktop",
+                    },
+                )
+            )
+            old_id = old["memory"]["memory_id"]
+
+        async with Client(server) as cursor:
+            new = ok(
+                await cursor.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "DECISION",
+                        "content": (
+                            "PostgreSQL is the source of truth for task state and "
+                            "queueing. Redis was removed in V1."
+                        ),
+                        "supersedes": [old_id],
+                        "client": "cursor",
+                    },
+                )
+            )
+            found = ok(
+                await cursor.call_tool(
+                    "memory_search", {"project_id": pid, "query": "queue", "limit": 100}
+                )
+            )
+            record = ok(
+                await cursor.call_tool("memory_history", {"project_id": pid, "memory_id": old_id})
+            )
+
+        assert new["superseded"] == [old_id]
+
+        # Retrieval returns exactly one answer, and it is the current one.
+        contents = [r["content"] for r in found["results"]]
+        assert len(contents) == 1
+        assert contents[0].startswith("PostgreSQL is the source of truth")
+        assert "Redis is the task queue." not in contents
+
+        # History still has it, with the link to what replaced it.
+        assert record["status"] == "SUPERSEDED"
+        assert record["memory"]["content"] == "Redis is the task queue."
+        assert record["superseded_by"]["memory_id"] == new["memory"]["memory_id"]
+        assert record["revisions"][0]["author_client"] == "claude-desktop"
+
+    async def test_deduplication_is_reported_as_corroboration(self, server: MCPServer) -> None:
+        """Two clients, one fact.
+
+        Cursor asserting what Claude Desktop already stored is not an error and
+        not a duplicate - it is a second independent voice, and the response says
+        so through attestation_count.
+        """
+        async with Client(server) as claude:
+            pid = await make_project(claude, "dedup-protocol")
+            first = ok(
+                await claude.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "DECISION",
+                        "content": "PostgreSQL is the task queue.",
+                        "client": "claude-desktop",
+                    },
+                )
+            )
+
+        async with Client(server) as cursor:
+            second = ok(
+                await cursor.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "DECISION",
+                        "content": "postgresql is the task queue",
+                        "client": "cursor",
+                    },
+                )
+            )
+            found = ok(await cursor.call_tool("memory_search", {"project_id": pid}))
+
+        assert first["outcome"] == "created"
+        assert first["attestation_count"] == 1
+        # Case and trailing punctuation are formatting, not meaning.
+        assert second["outcome"] == "deduplicated"
+        assert second["memory"]["memory_id"] == first["memory"]["memory_id"]
+        assert second["attestation_count"] == 2
+        assert found["returned"] == 1
+
+    async def test_forget_hides_but_history_still_answers(self, server: MCPServer) -> None:
+        async with Client(server) as client:
+            pid = await make_project(client, "forget-protocol")
+            created = ok(
+                await client.call_tool(
+                    "memory_remember",
+                    {"project_id": pid, "type": "FACT", "content": "A passing detail."},
+                )
+            )
+            memory_id = created["memory"]["memory_id"]
+
+            forgotten = ok(
+                await client.call_tool(
+                    "memory_forget",
+                    {
+                        "project_id": pid,
+                        "memory_id": memory_id,
+                        "reason": "no longer relevant",
+                    },
+                )
+            )
+            again = ok(
+                await client.call_tool("memory_forget", {"project_id": pid, "memory_id": memory_id})
+            )
+            found = ok(await client.call_tool("memory_search", {"project_id": pid}))
+            record = ok(
+                await client.call_tool(
+                    "memory_history", {"project_id": pid, "memory_id": memory_id}
+                )
+            )
+
+        assert forgotten["outcome"] == "forgotten"
+        assert again["outcome"] == "already_forgotten"
+        assert found["returned"] == 0
+        assert record["status"] == "DELETED"
+        assert record["revisions"][0]["content"] == "A passing detail."
+
+    async def test_history_shows_the_full_revision_chain(self, server: MCPServer) -> None:
+        """v1 to v2 to v3, with authorship preserved at every step."""
+        async with Client(server) as client:
+            pid = await make_project(client, "history-chain")
+            created = ok(
+                await client.call_tool(
+                    "memory_remember",
+                    {
+                        "project_id": pid,
+                        "type": "DECISION",
+                        "content": "Version one.",
+                        "client": "claude-desktop",
+                    },
+                )
+            )
+            memory_id = created["memory"]["memory_id"]
+
+            steps = ((1, "Version two.", "cursor"), (2, "Version three.", "claude-desktop"))
+            for revision, body, who in steps:
+                ok(
+                    await client.call_tool(
+                        "memory_revise",
+                        {
+                            "project_id": pid,
+                            "memory_id": memory_id,
+                            "expected_revision": revision,
+                            "content": body,
+                            "client": who,
+                        },
+                    )
+                )
+
+            record = ok(
+                await client.call_tool(
+                    "memory_history", {"project_id": pid, "memory_id": memory_id}
+                )
+            )
+
+        revisions = record["revisions"]
+        assert [r["revision_no"] for r in revisions] == [1, 2, 3]
+        assert [r["content"] for r in revisions] == [
+            "Version one.",
+            "Version two.",
+            "Version three.",
+        ]
+        assert [r["is_current"] for r in revisions] == [False, False, True]
+        assert [r["author_client"] for r in revisions] == [
+            "claude-desktop",
+            "cursor",
+            "claude-desktop",
+        ]
+
+    async def test_forget_description_points_at_purge_for_secrets(self, server: MCPServer) -> None:
+        """Tombstoning a leaked credential hides it without erasing it.
+
+        The description has to say so, or a model will report the problem solved
+        while the secret is still in the database.
+        """
+        async with Client(server) as client:
+            listed = await client.list_tools()
+        forget_tool = next(t for t in listed.tools if t.name == "memory_forget")
+        assert forget_tool.description is not None
+        assert "forgetting is not enough" in forget_tool.description
+        assert "operator purge" in forget_tool.description

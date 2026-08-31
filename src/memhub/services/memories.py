@@ -1,14 +1,19 @@
 """Memory write and read services.
 
-Milestone 2 scope:
+Milestone 3 scope:
 
-*In* - create at revision 1; revise via compare-and-set; idempotent writes;
-audit trail; structured filter and substring retrieval.
+*In* - create, revise via compare-and-set, idempotent writes, deduplication with
+attestation, supersession, tombstoning, history, audit trail, and structured
+retrieval behind the stage-0 filter.
 
-*Out* - deduplication and supersession (Milestone 3), full-text ranking (5),
-semantic search (7), context budgeting (8). ``content_hash`` is computed on
-every write but nothing reads it yet: the column is ``NOT NULL`` on an
-append-only table, so backfilling it later would need a data migration.
+*Out* - full-text ranking (Milestone 5), semantic search (7), context budgeting
+(8).
+
+The write path now resolves in one of three ways, and the caller is told which:
+the content is new (``created``), another client already asserted it
+(``deduplicated``), or this exact request already ran (``idempotent_replay``).
+Those are three different things and conflating any two of them loses
+information the caller needs.
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from memhub.domain.enums import AuthorKind, MemoryType
 from memhub.domain.errors import MemoryNotFoundError
 from memhub.domain.models import (
+    ForgetResult,
+    MemoryHistory,
     MemoryView,
     RememberResult,
     ReviseConflicted,
@@ -42,6 +49,7 @@ from memhub.domain.validation import (
 from memhub.observability import metrics as m
 from memhub.persistence.repositories.audit import AuditRepository
 from memhub.persistence.repositories.memories import MemoryRepository, to_view
+from memhub.persistence.repositories.truth import TruthRepository
 from memhub.services import idempotency
 
 _METRICS = m.get_metrics()
@@ -56,6 +64,7 @@ async def remember(
     tags: Sequence[str] | None = None,
     importance: int | None = None,
     expires_at: dt.datetime | None = None,
+    supersedes: Sequence[uuid.UUID] | None = None,
     source: str | None = None,
     author_client: str = "unknown",
     author_kind: AuthorKind = AuthorKind.AGENT,
@@ -63,12 +72,19 @@ async def remember(
     request_id: str | None = None,
     now: dt.datetime | None = None,
 ) -> RememberResult:
-    """Record a new memory.
+    """Record a new memory, optionally retiring the ones it replaces.
 
-    With a ``client_request_id``, a retry that arrives after the original
-    committed replays the original result rather than creating a second memory.
-    Without one, a retry creates a duplicate - which is why the tool description
-    asks for a key.
+    **Supersession is folded in here rather than being its own operation**, and
+    that is a correctness decision, not an API-size one. Retiring a fact and
+    asserting its replacement are a single atomic act: doing them as two calls
+    creates a window in which the old fact is gone and the new one does not yet
+    exist, and a client reading during that window would see the project as
+    having no opinion about something it has a firm opinion about.
+
+    With a ``client_request_id``, a retry arriving after the original committed
+    replays the original result rather than creating a second memory. Without
+    one, a retry creates a duplicate - which is why the tool description asks
+    for a key.
 
     ``now`` is injectable so TTL policy is testable without sleeping. The
     *stored* timestamps still come from the database clock, so two server
@@ -103,11 +119,28 @@ async def remember(
             return RememberResult(memory=replayed, outcome="idempotent_replay")
 
     repo = MemoryRepository(session)
+    truth = TruthRepository(session)
+    audit = AuditRepository(session)
+    digest = content_hash(clean_content)
+
+    # Deduplication, on a SAVEPOINT.
+    #
+    # The dedup key carries a foreign key to the memory, so the memory row has
+    # to exist before the key can be claimed - which means the insert is
+    # speculative. A savepoint is what makes that safe: if the key turns out to
+    # be taken, only the speculative insert is undone. The enclosing transaction
+    # is untouched, because it belongs to the caller and may already contain an
+    # idempotency claim that must survive.
+    #
+    # Rolling back the whole session here instead would silently discard that
+    # claim, and would break any caller managing its own transaction.
+    savepoint = await session.begin_nested()
+
     memory, revision = await repo.create(
         project_id,
         memory_type=memory_type,
         content=clean_content,
-        content_hash=content_hash(clean_content),
+        content_hash=digest,
         hash_version=HASH_VERSION,
         tags=clean_tags,
         importance=clean_importance,
@@ -117,7 +150,45 @@ async def remember(
         source=source,
     )
 
-    await AuditRepository(session).record(
+    claimed = await truth.claim_dedup_key(
+        project_id, content_hash=digest, hash_version=HASH_VERSION, memory_id=memory.id
+    )
+
+    if claimed is None:
+        # Another client already asserted this fact. Do not create a second
+        # memory - but do not throw the event away either: a second, independent
+        # assertion is evidence the fact is load-bearing.
+        await savepoint.rollback()
+
+        holder = await truth.dedup_key_holder(
+            project_id, content_hash=digest, hash_version=HASH_VERSION
+        )
+        if holder is None:  # pragma: no cover - the key was released concurrently
+            raise MemoryNotFoundError("Deduplication key vanished mid-transaction.")
+
+        return await _deduplicate(
+            session,
+            project_id,
+            holder,
+            memory_type=memory_type,
+            author_client=author_client,
+            request_id=request_id,
+        )
+
+    await savepoint.commit()
+
+    superseded, not_superseded = await _apply_supersession(
+        session,
+        project_id,
+        winner_id=memory.id,
+        targets=supersedes or (),
+        author_client=author_client,
+        request_id=request_id,
+    )
+
+    attestations = await truth.attest(project_id, memory.id, client_name=author_client)
+
+    await audit.record(
         action="remember",
         outcome="ok",
         actor_client=author_client,
@@ -127,6 +198,7 @@ async def remember(
         request_id=request_id,
         type=memory_type.value,
         content_length=len(clean_content),
+        superseded_count=len(superseded),
     )
 
     if client_request_id is not None:
@@ -138,7 +210,179 @@ async def remember(
         )
 
     _METRICS.increment(m.WRITES, type=memory_type.value, outcome="created")
-    return RememberResult(memory=to_view(memory, revision), outcome="created")
+    if superseded:
+        _METRICS.increment(m.SUPERSESSIONS, value=len(superseded))
+
+    return RememberResult(
+        memory=to_view(memory, revision),
+        outcome="created",
+        superseded=tuple(superseded),
+        not_superseded=tuple(not_superseded),
+        attestation_count=attestations,
+    )
+
+
+async def _deduplicate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    holder_id: uuid.UUID,
+    *,
+    memory_type: MemoryType,
+    author_client: str,
+    request_id: str | None,
+) -> RememberResult:
+    """Return the existing memory and record the corroboration.
+
+    The speculative insert has already been undone by the savepoint rollback, so
+    the memory that was created and rejected leaves no trace. This function does
+    not commit - the enclosing transaction belongs to the caller.
+    """
+    truth = TruthRepository(session)
+    existing = await get_memory(session, project_id, holder_id)
+    if existing is None:  # pragma: no cover - retired between rollback and re-read
+        raise MemoryNotFoundError(
+            f"Deduplication points at memory {holder_id}, which is no longer active.",
+            memory_id=str(holder_id),
+        )
+
+    attestations = await truth.attest(project_id, holder_id, client_name=author_client)
+    await AuditRepository(session).record(
+        action="remember",
+        outcome="dedup",
+        actor_client=author_client,
+        project_id=project_id,
+        memory_id=holder_id,
+        revision_no=existing.revision_no,
+        request_id=request_id,
+        attestation_count=attestations,
+    )
+
+    _METRICS.increment(m.WRITES, type=memory_type.value, outcome="deduplicated")
+    _METRICS.increment(m.DEDUPLICATIONS)
+    return RememberResult(memory=existing, outcome="deduplicated", attestation_count=attestations)
+
+
+async def _apply_supersession(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    winner_id: uuid.UUID,
+    targets: Sequence[uuid.UUID],
+    author_client: str,
+    request_id: str | None,
+) -> tuple[list[uuid.UUID], list[uuid.UUID]]:
+    """Retire the memories this assertion replaces.
+
+    Targets are locked in **ascending id order**. Every write path in the system
+    takes memory row locks in a single consistent order, which is what makes the
+    whole thing deadlock-free: two clients superseding overlapping sets cannot
+    form a cycle.
+
+    A target that was already retired, deleted, or absent is reported back rather
+    than silently skipped. Telling a caller "I retired 3 memories" when only 2
+    existed is a lie they would act on.
+    """
+    if not targets:
+        return [], []
+
+    truth = TruthRepository(session)
+    audit = AuditRepository(session)
+    retired: list[uuid.UUID] = []
+    skipped: list[uuid.UUID] = []
+
+    for target in sorted(set(targets)):
+        if target == winner_id:
+            skipped.append(target)
+            continue
+        if await truth.supersede(project_id, target, winner_id=winner_id):
+            retired.append(target)
+            await audit.record(
+                action="supersede",
+                outcome="ok",
+                actor_client=author_client,
+                project_id=project_id,
+                memory_id=target,
+                request_id=request_id,
+                superseded_by=str(winner_id),
+            )
+        else:
+            skipped.append(target)
+
+    return retired, skipped
+
+
+async def forget(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    memory_id: uuid.UUID,
+    *,
+    reason: str | None = None,
+    author_client: str = "unknown",
+    request_id: str | None = None,
+) -> ForgetResult:
+    """Tombstone a memory.
+
+    Reversible and content-preserving: this sets a status, it does not delete
+    anything. Every revision stays in the log so ``memory_history`` can still
+    explain what the memory said and when it stopped applying.
+
+    Forgetting an already-retired memory is an idempotent no-op, not an error.
+    """
+    truth = TruthRepository(session)
+    if not await truth.exists(project_id, memory_id):
+        raise MemoryNotFoundError(
+            f"No memory {memory_id} in this project.", memory_id=str(memory_id)
+        )
+
+    forgotten = await truth.forget(project_id, memory_id)
+    await AuditRepository(session).record(
+        action="forget",
+        outcome="ok" if forgotten else "rejected",
+        actor_client=author_client,
+        project_id=project_id,
+        memory_id=memory_id,
+        request_id=request_id,
+        reason=reason,
+        already_retired=not forgotten,
+    )
+    _METRICS.increment(m.FORGETS, outcome="forgotten" if forgotten else "already_forgotten")
+    return ForgetResult(
+        memory_id=memory_id,
+        outcome="forgotten" if forgotten else "already_forgotten",
+    )
+
+
+async def history(
+    session: AsyncSession, project_id: uuid.UUID, memory_id: uuid.UUID
+) -> MemoryHistory:
+    """Everything the system knows about one memory, retired or not.
+
+    This is the counterweight to stale-memory suppression. Retirement removes a
+    memory from retrieval; it must not remove it from the record. Without this,
+    the system would simply be deleting inconvenient history and there would be
+    no way to ask why something changed.
+
+    Note the ``include_retired=True``: this is one of only two places that flag
+    is used, and it is the reason normal retrieval can be unconditional about
+    what it excludes.
+    """
+    repo = MemoryRepository(session)
+    truth = TruthRepository(session)
+
+    row = await repo.get(project_id, memory_id, include_retired=True)
+    if row is None:
+        raise MemoryNotFoundError(
+            f"No memory {memory_id} in this project.", memory_id=str(memory_id)
+        )
+
+    return MemoryHistory(
+        memory=to_view(row[0], row[1]),
+        revisions=tuple(await truth.revisions(memory_id)),
+        superseded_by=await truth.superseded_by(project_id, memory_id),
+        supersedes=tuple(await truth.supersedes(project_id, memory_id)),
+        attestations=tuple(await truth.attestations(memory_id)),
+        audit=tuple(await truth.audit_trail(memory_id)),
+    )
 
 
 async def revise(

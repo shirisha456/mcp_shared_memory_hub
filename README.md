@@ -4,8 +4,8 @@ A persistent, versioned memory service that lets multiple MCP-compatible AI clie
 knowledge across sessions, with conflict-safe updates, provenance, hybrid retrieval, stale-memory
 handling, and context-budgeted recall.
 
-**Status: correctness core.** Four MCP tools over stdio, backed by PostgreSQL, with
-compare-and-set updates and idempotent writes. See
+**Status: truth maintenance.** Six MCP tools over stdio, backed by PostgreSQL, with
+compare-and-set updates, idempotent writes, deduplication and stale-memory suppression. See
 [`docs/architecture.md`](docs/architecture.md) for the full design and
 [the roadmap](docs/architecture.md#15-revised-roadmap) for what lands when.
 
@@ -95,12 +95,15 @@ Each client spawns its **own** server process. They share nothing but PostgreSQL
 | `project_use` | Resolve or explicitly create a project namespace. Never creates implicitly. |
 | `memory_remember` | Record one durable piece of project knowledge. |
 | `memory_revise` | Update a memory, guarded by `expected_revision`. A conflict returns the winning version, not an error. |
+| `memory_forget` | Tombstone a memory. Reversible; content is never destroyed. |
 | `memory_search` | Retrieve active memories. Superseded, deleted and expired are never returned. |
+| `memory_history` | Full record for one memory, including retired ones: revisions, lineage, attestations, audit. |
 
 Plus one read-only resource, `memory://memories/{memory_id}`.
 
-`memory_forget`, `memory_history` and `memory_context` arrive with the milestones that give them
-something to do.
+`memory_context` arrives with the context-budget milestone. Supersession is deliberately not a
+seventh tool: retiring a fact and asserting its replacement are one atomic act, so
+`memory_remember` takes a `supersedes` argument.
 
 ## Milestone status
 
@@ -109,8 +112,8 @@ something to do.
 | 0 | Skeleton: Docker, Alembic, logging, test harness, CI | done |
 | 1 | Projects, memories, immutable revisions, 3 MCP tools over stdio | done |
 | 2 | Compare-and-set revise, idempotency, audit log, metrics | done |
-| 3 | Deduplication, attestations, supersession, forget, history | next |
-| 4 | Claude Desktop / Cursor integration, golden manifest | |
+| 3 | Deduplication, attestations, supersession, forget, history | done |
+| 4 | Claude Desktop / Cursor integration, golden manifest | next |
 | 5 | Full-text retrieval | |
 | 6 | Evaluation harness (before vectors, deliberately) | |
 | 7 | pgvector, embedding outbox, hybrid RRF ranking | |
@@ -154,11 +157,41 @@ Note that `memory_revise` does not *need* a key for correctness — the compare-
 a duplicate write impossible. The key is there so a retry after a dropped connection replays cleanly
 instead of reporting a conflict against yourself.
 
-### What is deliberately not built yet
+### Stale-memory suppression
 
-Supersession and deduplication are **schema-ready but not implemented**: `memories` carries
-`superseded_by_id`, and `content_hash` is computed on every write because the column is `NOT NULL`
-on an append-only table and backfilling it later would need a data migration.
+The problem the project exists for. A project once used Redis as its queue and now uses PostgreSQL.
+Both statements were true when written; only one is true now. A retrieval-only system returns both
+and lets similarity decide — and similarity has no opinion about which is current, so the stale
+phrasing often wins because it matches the query *better*.
+
+Recording the replacement with `supersedes` retires the old fact in the same transaction. It leaves
+retrieval immediately and stays fully readable through `memory_history`, with a link to what
+replaced it and who wrote it.
+
+The assertion that matters in `tests/integration/test_stale_memory.py` is not "the right answer
+ranks first" — it is **"the wrong answer is absent at every limit"**, checked across limits 1 to 100
+and several queries including `redis` itself. Ranking can bury a stale fact; only structure can
+exclude it. Removing the status condition from the stage-0 filter makes five of those tests fail —
+verified by mutation.
+
+### Deduplication is not idempotency
+
+| | Idempotency | Deduplication |
+|---|---|---|
+| Trigger | one client retries the same request | two clients assert the same fact |
+| Key | caller-supplied `client_request_id` | normalised content hash |
+| Answer | replay the original response | return the existing memory, record corroboration |
+
+A deduplicated write is evidence, not a nuisance: when Cursor states what Claude Desktop already
+stored, that second independent assertion is recorded as an attestation, and
+`COUNT(DISTINCT client_name)` becomes a ranking prior later. Counted per client, so one client
+retrying in a loop cannot manufacture corroboration.
+
+The dedup key lives in its own table rather than as a partial unique index, because the rule spans
+two tables — `is_current` on the revision, `status` on the memory — and no index can. Retirement
+releases the key, so a sentence can be legitimately re-asserted if a decision is reversed.
+
+### What is deliberately not built yet
 
 Search is substring matching with a deterministic total order. No relevance ranking, because
 Milestone 6 builds the evaluation harness that can prove ranking is an improvement — and building

@@ -15,6 +15,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from memhub.domain.models import (
+    ForgetResult,
+    MemoryHistory,
     MemoryView,
     ProjectRef,
     RememberResult,
@@ -80,19 +82,43 @@ class MemoryOut(BaseModel):
 
 
 class RememberOut(BaseModel):
-    outcome: Literal["created", "idempotent_replay"] = Field(
+    outcome: Literal["created", "deduplicated", "idempotent_replay"] = Field(
         description=(
             "How the write resolved. 'created': a new memory was stored. "
-            "'idempotent_replay': this exact request had already been applied, so "
-            "nothing new was written and the original memory is returned. Branch "
-            "on this rather than assuming a memory was newly created."
+            "'deduplicated': another client had already recorded this exact fact, "
+            "so the existing memory is returned and your assertion was recorded as "
+            "corroboration. 'idempotent_replay': this exact request had already "
+            "been applied. Branch on this rather than assuming a new memory."
         )
     )
     memory: MemoryOut
+    superseded: list[str] = Field(
+        default_factory=list, description="Memories this assertion retired."
+    )
+    not_superseded: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Requested for supersession but not retired - already retired, deleted, "
+            "or not in this project. Check this rather than assuming all succeeded."
+        ),
+    )
+    attestation_count: int = Field(
+        default=1,
+        description=(
+            "Distinct clients that have asserted this fact. Above 1 means it was "
+            "independently corroborated."
+        ),
+    )
 
     @classmethod
     def of(cls, result: RememberResult) -> RememberOut:
-        return cls(outcome=result.outcome, memory=MemoryOut.of(result.memory))
+        return cls(
+            outcome=result.outcome,
+            memory=MemoryOut.of(result.memory),
+            superseded=[str(m) for m in result.superseded],
+            not_superseded=[str(m) for m in result.not_superseded],
+            attestation_count=result.attestation_count,
+        )
 
 
 class SearchOut(BaseModel):
@@ -176,4 +202,143 @@ class ReviseOut(BaseModel):
                 f"expected_revision={result.current.revision_no}. Do not simply "
                 "resend your original text: that would discard their change."
             ),
+        )
+
+
+class ForgetOut(BaseModel):
+    outcome: Literal["forgotten", "already_forgotten"] = Field(
+        description=(
+            "'forgotten': the memory is now excluded from retrieval. "
+            "'already_forgotten': it had already been retired, so nothing changed."
+        )
+    )
+    memory_id: str
+    note: str = Field(
+        default=(
+            "Tombstoned, not destroyed. Every revision remains readable through "
+            "memory_history; only an operator can permanently erase content."
+        )
+    )
+
+    @classmethod
+    def of(cls, result: ForgetResult) -> ForgetOut:
+        return cls(outcome=result.outcome, memory_id=str(result.memory_id))
+
+
+class RevisionOut(BaseModel):
+    revision_no: int
+    content: str
+    tags: list[str]
+    is_current: bool
+    change_reason: str | None
+    author_client: str
+    author_kind: str
+    created_at: dt.datetime
+
+
+class AttestationOut(BaseModel):
+    client_name: str
+    times_seen: int
+    first_seen_at: dt.datetime
+    last_seen_at: dt.datetime
+
+
+class SupersessionOut(BaseModel):
+    memory_id: str
+    content: str
+    at: dt.datetime | None
+
+
+class AuditOut(BaseModel):
+    at: dt.datetime
+    action: str
+    outcome: str
+    actor_client: str
+    revision_no: int | None
+
+
+class HistoryOut(BaseModel):
+    """The full record for one memory, including what retrieval hides.
+
+    This is the counterweight to stale-memory suppression: a retired memory
+    leaves retrieval but never leaves the record, so it is always possible to ask
+    what a project used to believe and when that changed.
+    """
+
+    memory: MemoryOut
+    status: str = Field(
+        description=(
+            "ACTIVE memories appear in search. SUPERSEDED and DELETED do not, but "
+            "remain fully readable here."
+        )
+    )
+    revisions: list[RevisionOut] = Field(
+        description="Every revision, oldest first. Content is never overwritten."
+    )
+    superseded_by: SupersessionOut | None = Field(
+        default=None,
+        description="The memory that replaced this one. Present only if retired.",
+    )
+    supersedes: list[SupersessionOut] = Field(
+        default_factory=list, description="Memories this one retired."
+    )
+    attestations: list[AttestationOut] = Field(
+        default_factory=list,
+        description=(
+            "Clients that independently asserted this fact. More than one distinct "
+            "client is corroboration."
+        ),
+    )
+    audit: list[AuditOut] = Field(default_factory=list, description="Recent events, newest first.")
+
+    @classmethod
+    def of(cls, history: MemoryHistory) -> HistoryOut:
+        return cls(
+            memory=MemoryOut.of(history.memory),
+            status=history.memory.status.value,
+            revisions=[
+                RevisionOut(
+                    revision_no=r.revision_no,
+                    content=r.content,
+                    tags=list(r.tags),
+                    is_current=r.is_current,
+                    change_reason=r.change_reason,
+                    author_client=r.author_client,
+                    author_kind=r.author_kind.value,
+                    created_at=r.created_at,
+                )
+                for r in history.revisions
+            ],
+            superseded_by=(
+                SupersessionOut(
+                    memory_id=str(history.superseded_by.memory_id),
+                    content=history.superseded_by.content,
+                    at=history.superseded_by.at,
+                )
+                if history.superseded_by
+                else None
+            ),
+            supersedes=[
+                SupersessionOut(memory_id=str(s.memory_id), content=s.content, at=s.at)
+                for s in history.supersedes
+            ],
+            attestations=[
+                AttestationOut(
+                    client_name=a.client_name,
+                    times_seen=a.times_seen,
+                    first_seen_at=a.first_seen_at,
+                    last_seen_at=a.last_seen_at,
+                )
+                for a in history.attestations
+            ],
+            audit=[
+                AuditOut(
+                    at=e.at,
+                    action=e.action,
+                    outcome=e.outcome,
+                    actor_client=e.actor_client,
+                    revision_no=e.revision_no,
+                )
+                for e in history.audit
+            ],
         )

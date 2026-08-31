@@ -11,8 +11,13 @@ store credentials; state a rejected alternative inside the decision rather than
 as a standalone fact. Those sentences are load-bearing for correctness, and the
 golden-manifest protocol test fails if they change by accident.
 
-Milestone 2 exposes four tools. ``memory_forget``, ``memory_context`` and
-``memory_history`` arrive with the milestones that give them something to do.
+Six tools. ``memory_context`` arrives with the context-budget milestone.
+
+Supersession is deliberately *not* a seventh tool: retiring a fact and
+asserting its replacement are one atomic act, so ``memory_remember`` takes a
+``supersedes`` argument instead. Splitting them would leave a window in which
+the project appears to have no opinion about something it has a firm opinion
+about.
 """
 
 # NOTE: no ``from __future__ import annotations`` in this module, deliberately.
@@ -32,7 +37,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from memhub.domain.enums import AuthorKind, MemoryType
 from memhub.domain.errors import ValidationFailedError
 from memhub.mcp.mapping import domain_errors
-from memhub.mcp.schemas import MemoryOut, ProjectOut, RememberOut, ReviseOut, SearchOut
+from memhub.mcp.schemas import (
+    ForgetOut,
+    HistoryOut,
+    MemoryOut,
+    ProjectOut,
+    RememberOut,
+    ReviseOut,
+    SearchOut,
+)
 from memhub.persistence.engine import session_scope
 from memhub.services import memories as memory_service
 from memhub.services import projects as project_service
@@ -163,6 +176,15 @@ def build_server(
             "Record one self-contained statement per call - something that will "
             "still make sense to a different client in a month with no other "
             "context. Do not record conversational chatter.\n\n"
+            "When a decision REPLACES an earlier one, pass the old memory's id in "
+            "supersedes. The old fact stops appearing in search immediately, in the "
+            "same transaction, so no client can ever see both as simultaneously "
+            "true. It stays readable through memory_history. Do not instead record "
+            "a new memory saying 'X is no longer true' - that leaves the original "
+            "in circulation and adds a second thing to contradict it.\n\n"
+            "If another client already recorded the same fact, you get that memory "
+            "back with outcome='deduplicated' and your assertion is recorded as "
+            "corroboration. That is a success, not a failure.\n\n"
             "NEVER record credentials, API keys, tokens, private keys or .env "
             "contents. This is not a secret store."
         ),
@@ -184,6 +206,15 @@ def build_server(
         importance: Annotated[
             int | None,
             Field(description="0-100. Defaults by type; raise it for load-bearing knowledge."),
+        ] = None,
+        supersedes: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Memory ids this assertion replaces. They stop appearing in "
+                    "search immediately, in the same transaction as this write."
+                )
+            ),
         ] = None,
         source: Annotated[
             str | None,
@@ -219,6 +250,9 @@ def build_server(
                 source=source,
                 author_client=client,
                 author_kind=(AuthorKind.HUMAN_CONFIRMED if human_confirmed else AuthorKind.AGENT),
+                supersedes=(
+                    [_parse_uuid(m, "supersedes") for m in supersedes] if supersedes else None
+                ),
                 client_request_id=client_request_id,
             )
             return RememberOut.of(result)
@@ -320,6 +354,71 @@ def build_server(
                 limit=limit,
             )
             return SearchOut.of(result)
+
+    @server.tool(
+        name="memory_forget",
+        title="Retire a memory",
+        description=(
+            "Stop a memory appearing in search, because it is no longer relevant "
+            "or should not have been recorded.\n\n"
+            "This tombstones, it does not destroy. Every revision stays readable "
+            "through memory_history, so the record of what the project once "
+            "believed survives. Calling it twice is harmless.\n\n"
+            "Use this when a fact has simply stopped mattering. If it was replaced "
+            "by a *different* fact, record the new one with supersedes instead - "
+            "that keeps the connection between old and new, which forgetting loses.\n\n"
+            "If a credential was recorded by mistake, forgetting is not enough: it "
+            "hides the content but does not erase it. Tell the user to run the "
+            "operator purge command. Permanent erasure is deliberately not "
+            "available through this interface."
+        ),
+    )
+    @domain_errors
+    async def memory_forget(
+        project_id: Annotated[str, Field(description="From project_use.")],
+        memory_id: Annotated[str, Field(description="The memory to retire.")],
+        reason: Annotated[
+            str | None, Field(description="Why, e.g. 'the feature was removed'.")
+        ] = None,
+        client: Annotated[str, Field(description="Your client name.")] = "unknown",
+    ) -> ForgetOut:
+        async with session_scope(session_factory) as session:
+            result = await memory_service.forget(
+                session,
+                _parse_uuid(project_id, "project_id"),
+                _parse_uuid(memory_id, "memory_id"),
+                reason=reason,
+                author_client=client,
+            )
+            return ForgetOut.of(result)
+
+    @server.tool(
+        name="memory_history",
+        title="Inspect a memory's full record",
+        description=(
+            "Show everything known about one memory, including memories that "
+            "search deliberately hides.\n\n"
+            "Returns every revision in order, which memory replaced this one (or "
+            "which ones it replaced), which clients independently asserted it, and "
+            "a recent audit trail.\n\n"
+            "Use it to answer 'why does the project do it this way now?' or 'what "
+            "did we believe before?'. Retired memories remain fully readable here - "
+            "they leave retrieval, never the record - so this is how you explain a "
+            "change rather than merely observe it."
+        ),
+    )
+    @domain_errors
+    async def memory_history(
+        project_id: Annotated[str, Field(description="From project_use.")],
+        memory_id: Annotated[str, Field(description="The memory to inspect. May be retired.")],
+    ) -> HistoryOut:
+        async with session_scope(session_factory) as session:
+            record = await memory_service.history(
+                session,
+                _parse_uuid(project_id, "project_id"),
+                _parse_uuid(memory_id, "memory_id"),
+            )
+            return HistoryOut.of(record)
 
     @server.resource(
         "memory://memories/{memory_id}",

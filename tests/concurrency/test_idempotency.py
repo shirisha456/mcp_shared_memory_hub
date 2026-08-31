@@ -120,17 +120,19 @@ async def test_different_keys_create_different_memories(
     assert all(r.outcome == "created" for r in results)  # type: ignore[union-attr]
 
 
-async def test_no_key_means_no_protection(
+async def test_identical_writes_deduplicate_even_without_a_key(
     sessions: Callable[[int], async_sessionmaker[AsyncSession]],
 ) -> None:
-    """Honest about the limits of the feature.
+    """Two mechanisms, one outcome here - and it is worth being precise about
+    which one did the work.
 
-    Without a key, a retry duplicates. That is why the tool description asks for
-    one, and it is worth pinning as behaviour so nobody later assumes writes are
-    idempotent by default.
+    Ten simultaneous writes of *identical* content collapse to one memory even
+    with no idempotency key, because deduplication catches them: the content
+    hash is a primary key, so only one writer can claim it. That is dedup, not
+    idempotency.
     """
     factory = sessions(10)
-    project_id = await seed_project(factory, "idem-none")
+    project_id = await seed_project(factory, "dedup-no-key")
 
     async def attempt(index: int) -> RememberResult:
         async with factory() as session, session.begin():
@@ -143,8 +145,60 @@ async def test_no_key_means_no_protection(
             )
 
     results = await run_together(attempt, 10)
+    for result in results:
+        assert not isinstance(result, BaseException), f"unexpected exception: {result!r}"
+
     memory_ids = {r.memory.memory_id for r in results}  # type: ignore[union-attr]
-    assert len(memory_ids) == 10
+    assert len(memory_ids) == 1
+
+    outcomes = [r.outcome for r in results]  # type: ignore[union-attr]
+    assert outcomes.count("created") == 1
+    assert outcomes.count("deduplicated") == 9
+
+    async with factory() as session:
+        count = (
+            await session.execute(
+                text("SELECT count(*) FROM memories WHERE project_id = :p"),
+                {"p": project_id},
+            )
+        ).scalar_one()
+        assert count == 1
+        await assert_invariants_hold(session)
+
+
+async def test_without_a_key_a_changed_retry_still_duplicates(
+    sessions: Callable[[int], async_sessionmaker[AsyncSession]],
+) -> None:
+    """Honest about the limits of deduplication.
+
+    Dedup keys on content, so it cannot help a retry whose content differs by so
+    much as a word - and a client rebuilding a request after a dropped
+    connection may well phrase it slightly differently. Only an idempotency key,
+    which identifies the *request* rather than the content, covers that case.
+
+    This is why the two mechanisms both exist and why the tool description asks
+    for a key rather than relying on dedup.
+    """
+    factory = sessions(10)
+    project_id = await seed_project(factory, "dedup-changed-retry")
+
+    async def attempt(index: int) -> RememberResult:
+        async with factory() as session, session.begin():
+            return await remember(
+                session,
+                project_id,
+                memory_type=MemoryType.FACT,
+                # The same intent, trivially different wording.
+                content=f"PostgreSQL is the task queue (attempt {index}).",
+                author_client="cursor",
+            )
+
+    results = await run_together(attempt, 10)
+    memory_ids = {r.memory.memory_id for r in results}  # type: ignore[union-attr]
+    assert len(memory_ids) == 10, (
+        "deduplication is content-addressed, so it cannot collapse requests that "
+        "differ textually - that is what an idempotency key is for"
+    )
 
 
 async def test_key_reuse_with_a_different_payload_is_rejected(

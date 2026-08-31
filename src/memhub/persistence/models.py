@@ -338,3 +338,79 @@ class AuditEvent(Base):
         Index("ix_audit_events_memory_id_at", "memory_id", text("at DESC")),
         Index("ix_audit_events_project_id_at", "project_id", text("at DESC")),
     )
+
+
+class MemoryDedupKey(Base):
+    """One row per distinct active fact in a project.
+
+    **Why a separate table rather than a partial unique index on revisions.**
+    The rule we want is "no two *active* memories in a project have identical
+    normalised content". ``is_current`` lives on the revision but ``status``
+    lives on the memory, and a unique index cannot span two tables. A dedicated
+    table whose rows we insert on create and delete on forget or supersede gives
+    a real unique constraint over exactly the right set - and makes deduplication
+    a single race-free ``INSERT ... ON CONFLICT DO NOTHING`` rather than a
+    check-then-insert.
+
+    The lifecycle matters as much as the constraint: retiring a memory releases
+    its key, so the same sentence can legitimately be asserted again later.
+
+    ``hash_version`` is in the primary key so a change to the normaliser can be
+    rolled out alongside the old one instead of as a big-bang re-hash.
+    """
+
+    __tablename__ = "memory_dedup_keys"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    hash_version: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    content_hash: Mapped[bytes] = mapped_column(LargeBinary, primary_key=True)
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_id", "project_id"],
+            ["memories.id", "memories.project_id"],
+            ondelete="CASCADE",
+        ),
+        Index("ix_memory_dedup_keys_memory_id", "memory_id"),
+    )
+
+
+class MemoryAttestation(Base):
+    """Which clients have independently asserted this fact.
+
+    A deduplicated write is evidence, not a nuisance. When Cursor states
+    something Claude Desktop already stored, that second, independent assertion
+    is a signal the fact is load-bearing - so instead of discarding the event we
+    record it, and from Milestone 7 the corroboration count becomes a small
+    ranking prior.
+
+    Keyed on client name rather than call count so that one client retrying in a
+    loop cannot manufacture corroboration; ``times_seen`` tracks repetition
+    separately from ``COUNT(DISTINCT client_name)``.
+    """
+
+    __tablename__ = "memory_attestations"
+
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    client_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    first_seen_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    last_seen_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    times_seen: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_id", "project_id"],
+            ["memories.id", "memories.project_id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("times_seen >= 1", name="times_seen_positive"),
+    )
