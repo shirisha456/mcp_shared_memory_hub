@@ -141,11 +141,11 @@ client runs the server from your project directory and Cursor's config has no `c
 ```
 
 Claude Desktop reads `%APPDATA%\Claude\claude_desktop_config.json`; Cursor reads
-`~/.cursor/mcp.json` or `.cursor/mcp.json`, and additionally wants `"type": "stdio"`.
+`~/.cursor/mcp.json` or `.cursor/mcp.json`, and also requires `"type": "stdio"`.
 
 Point both at the **same** `MEMHUB_DATABASE_URL`. Each client spawns its own server process, and
-those processes share nothing else — no memory, no cache, no files. Different URLs and everything
-still appears to work while each client quietly keeps a private corpus.
+those processes share nothing else — no memory, no cache, no files. Give them different URLs and
+everything will still appear to work, while each client quietly keeps a private corpus of its own.
 
 ## Tool surface
 
@@ -217,7 +217,7 @@ wrong reason. Removing the version predicate from the SQL makes those tests fail
 
 Idempotency is *one* client retrying *the same request*, keyed on a caller-supplied
 `client_request_id`; the retry replays the original response. Deduplication is *two* clients
-asserting *the same fact*, keyed on a content hash; that arrives next.
+asserting *the same fact*, keyed on a content hash. The two are compared directly below.
 
 The claim is `INSERT ... ON CONFLICT DO NOTHING` — "check then insert" races. If another transaction
 holds the key uncommitted, `SELECT ... FOR SHARE` blocks until it resolves: a row means it committed
@@ -230,10 +230,10 @@ instead of reporting a conflict against yourself.
 
 ### Stale-memory suppression
 
-The problem the project exists for. A project once used Redis as its queue and now uses PostgreSQL.
-Both statements were true when written; only one is true now. A retrieval-only system returns both
-and lets similarity decide — and similarity has no opinion about which is current, so the stale
-phrasing often wins because it matches the query *better*.
+This is the problem the project exists to solve. Suppose a project once used Redis as its queue and
+now uses PostgreSQL. Both statements were true when written; only one is true now. A retrieval-only
+system returns both and lets similarity decide, and similarity has no opinion about which is
+current, so the stale phrasing often wins precisely because it matches the query *better*.
 
 Recording the replacement with `supersedes` retires the old fact in the same transaction. It leaves
 retrieval immediately and stays fully readable through `memory_history`, with a link to what
@@ -255,8 +255,8 @@ verified by mutation.
 
 A deduplicated write is evidence, not a nuisance: when Cursor states what Claude Desktop already
 stored, that second independent assertion is recorded as an attestation, and
-`COUNT(DISTINCT client_name)` becomes a ranking prior later. Counted per client, so one client
-retrying in a loop cannot manufacture corroboration.
+`COUNT(DISTINCT client_name)` becomes a ranking prior later. Attestations are counted per client,
+so one client retrying in a loop cannot manufacture corroboration.
 
 The dedup key lives in its own table rather than as a partial unique index, because the rule spans
 two tables — `is_current` on the revision, `status` on the memory — and no index can. Retirement
@@ -305,9 +305,9 @@ simply do not appear in that ranking and contribute nothing.
 | full text, any-term fallback | 0.803 | 0.817 | 0.691 | **0.000** |
 | hybrid, RRF, distance ≤ 0.35 | **0.853** | **0.828** | 0.671 | **0.000** |
 
-The `jwt` query went from 0.000 to a perfect 1.000 — the stemmer never matched `JWTs`, and meaning
-does. `deadlock prevention` is still 0.000: the memory describes deadlock prevention without using
-the word, and 384 dimensions of a small model do not bridge that.
+The `jwt` query went from 0.000 to a perfect 1.000 — the stemmer never matched `JWTs`, whereas
+semantic similarity does. `deadlock prevention` is still 0.000: the memory describes deadlock
+prevention without ever using the word, and 384 dimensions of a small model do not bridge that.
 
 **The threshold is the part worth reading about.** Without one, hybrid scored nDCG 0.881 — and
 precision collapsed to **0.113**, with every unanswerable query returning ten results. Approximate
@@ -320,12 +320,12 @@ would have been true and badly misleading.
 
 Generating a vector inline would hold the `memories` row lock across a slow, fallible call — so one
 slow inference blocks every other writer, and a model being down becomes a *write* outage. Enqueuing
-after the transaction is the classic dual-write bug: crash between commit and enqueue and the memory
-exists forever with no vector and nothing knows.
+after the transaction is the classic dual-write bug: crash between the commit and the enqueue, and the
+memory exists forever with no vector and nothing to notice its absence.
 
 So the job row is inserted **in the same transaction as the revision** — both exist or neither does.
 A worker claims batches with `FOR UPDATE SKIP LOCKED`, which is what lets a worker in each client's
-server process drain one queue without contending. There's a test asserting four concurrent workers
+server process drain one queue without contending. A test asserts that four concurrent workers
 process exactly 40 jobs between them.
 
 The result is eventual consistency with an **explicit, queryable** pending state. Every search
@@ -381,8 +381,8 @@ for opposite responses.
 
 Stale suppression holds here too, tested at **every** budget from 100 to 8000 and every query, with
 the retired memory at maximum importance and its replacement at minimum. It holds for the same
-reason it held through full-text and through vectors: selection can only choose from candidates the
-stage-0 filter already excluded it from.
+reason it held through full-text and through vectors: selection can only choose from the candidate
+set, and the stage-0 filter has already removed the retired memory from that set.
 
 ### Failure is a specification, not an afterthought
 
@@ -391,9 +391,10 @@ The architecture lists eighteen ways this system can fail and what it does about
 it up — and says plainly which three are argued rather than tested, and why a test there would be
 testing PostgreSQL rather than this system.
 
-Writing that document found two things the prose had stopped being true about. Three error codes it
-promised did not exist anywhere in the code, so a database outage reached the model as an opaque
-internal error — which a model reads as *this tool is broken*, and then stops calling it. And the
+Writing that document exposed two claims the prose was still making that had quietly stopped being
+true. Three of the error codes it promised did not exist anywhere in the code, so a database outage
+reached the model as an opaque internal error, which a model reads as *this tool is broken* before
+it stops calling the tool altogether. And the
 documented degradation path fired only when the embedder failed, not when a query was cancelled,
 which is the likelier cause. Both are fixed.
 
