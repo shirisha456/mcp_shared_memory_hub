@@ -1,5 +1,13 @@
 # MCP Shared Memory Hub
 
+**An MCP server that gives AI coding assistants a shared, persistent memory of your project.**
+
+Claude Desktop, Cursor, and any other MCP client read and write one PostgreSQL-backed store. What
+you tell one assistant survives the end of the session and is there for the next one — and when a
+decision is reversed, the old one stops being returned at all.
+
+## The problem
+
 **Monday.** You spend twenty minutes explaining to an AI assistant why the background job queue
 should be Redis. It follows the reasoning and writes good code.
 
@@ -26,8 +34,9 @@ Storing facts is easy. *Retiring* them — so that a reversed decision can never
 matter how someone searches for it — is a data-modelling and retrieval problem. Most of this
 repository is about that third bullet.
 
-**What it does.** One PostgreSQL database that any number of MCP clients read and write through:
-conflict-safe updates, immutable revision history with supersession, hybrid keyword + vector
+## What it does
+
+Conflict-safe updates, immutable revision history with supersession, hybrid keyword + vector
 retrieval, and recall that fits inside a token budget the caller specifies.
 
 Measured rather than asserted — a hand-graded dataset of 34 queries, re-scored on every change:
