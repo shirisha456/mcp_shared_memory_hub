@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: lint + types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: ruff (lint)
+        run: ruff check .
+      - name: ruff (format)
+        run: ruff format --check .
+      - name: mypy (strict)
+        run: mypy
+
+  tests:
+    name: tests (PostgreSQL 16)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Same image as docker-compose so CI and local development cannot drift.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: memhub
+          POSTGRES_PASSWORD: memhub
+          POSTGRES_DB: memhub
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U memhub -d memhub"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      MEMHUB_DATABASE_URL: postgresql+asyncpg://memhub:memhub@localhost:5435/memhub
+      # Turns "database unreachable" from a silent skip into a hard failure, so a
+      # broken service container can never be mistaken for a green build.
+      MEMHUB_REQUIRE_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+
+      - name: migrations round-trip
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: schema drift check
+        run: alembic check
+
+      - name: pytest
+        run: pytest -v

@@ -1,0 +1,36 @@
+services:
+  postgres:
+    # pgvector image from day one so Milestone 7 (semantic retrieval) needs no
+    # infrastructure change. The extension is NOT created yet - that is Milestone 7.
+    image: pgvector/pgvector:pg16
+    container_name: memhub-postgres
+    environment:
+      POSTGRES_USER: memhub
+      POSTGRES_PASSWORD: memhub
+      POSTGRES_DB: memhub
+    ports:
+      # 5435 on the host so a locally installed PostgreSQL on 5432 does not clash.
+      - "5435:5432"
+    volumes:
+      - memhub-pgdata:/var/lib/postgresql/data
+    command:
+      - postgres
+      # Milestone 2 runs 50 genuinely concurrent writers, each needing its own
+      # backend. The default of 100 leaves too little headroom once the test
+      # harness, template databases and a live server are also connected.
+      - "-c"
+      - "max_connections=200"
+      # Surfaces slow queries during the performance work in Milestone 9.
+      - "-c"
+      - "log_min_duration_statement=200"
+      - "-c"
+      - "log_lock_waits=on"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memhub -d memhub"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  memhub-pgdata:

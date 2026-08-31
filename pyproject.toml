@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memhub"
+version = "0.1.0"
+description = "MCP Shared Memory Hub - a persistent, versioned, conflict-safe shared memory service for MCP-compatible AI clients."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+dependencies = [
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+]
+
+# NOTE: the MCP SDK is deliberately NOT a dependency yet. It arrives in Milestone 1,
+# where the exact current package name and version will be verified against official
+# docs rather than guessed here.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memhub"]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # bugbear
+    "A",      # builtin shadowing
+    "C4",     # comprehensions
+    "T20",    # flake8-print  <- stdout is the JSON-RPC channel. print() is banned.
+    "ASYNC",  # async correctness
+    "RUF",
+]
+ignore = [
+    "E501",   # line length is handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic templates are generated; migrations are intentionally terse.
+"migrations/*" = ["N999", "B"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+show_error_codes = true
+pretty = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+# Alembic's generated env/versions modules are not worth strict-typing.
+module = ["migrations.*", "alembic.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# asyncpg ships no py.typed marker. It is used directly only in the test harness,
+# for administrative statements (CREATE/DROP DATABASE) that cannot run inside a
+# transaction. Application code reaches PostgreSQL through SQLAlchemy, which is
+# fully typed, so this exemption does not weaken checking of src/.
+module = ["asyncpg.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Both scopes must be "session". The database fixtures are session- and
+# module-scoped, so their connections are bound to the loop that created them.
+# With function-scoped test loops, the second test in a module reaches for a
+# pooled connection created in an already-closed loop and fails with
+# "Event loop is closed" - a confusing symptom of a scope mismatch, not a bug in
+# the code under test.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: requires a real PostgreSQL instance",
+    "concurrency: exercises real concurrent database access",
+]
+filterwarnings = ["error"]
