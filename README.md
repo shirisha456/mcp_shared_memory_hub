@@ -135,8 +135,8 @@ seventh tool: retiring a fact and asserting its replacement are one atomic act, 
 | 2 | Compare-and-set revise, idempotency, audit log, metrics | done |
 | 3 | Deduplication, attestations, supersession, forget, history | done |
 | 4 | Claude Desktop / Cursor integration, golden manifest | done |
-| 5 | Full-text retrieval | next |
-| 6 | Evaluation harness (before vectors, deliberately) | |
+| 5 | Full-text retrieval | done |
+| 6 | Evaluation harness (before vectors, deliberately) | next |
 | 7 | pgvector, embedding outbox, hybrid RRF ranking | |
 | 8 | Context builder under a token budget | |
 | 9 | Failure injection, benchmarks, `EXPLAIN ANALYZE` | |
@@ -214,9 +214,30 @@ releases the key, so a sentence can be legitimately re-asserted if a decision is
 
 ### What is deliberately not built yet
 
-Search is substring matching with a deterministic total order. No relevance ranking, because
-Milestone 6 builds the evaluation harness that can prove ranking is an improvement — and building
-the measurement after the optimisation means fitting the metric to the conclusion.
+### Retrieval
+
+Full-text over a `tsvector` generated column with a partial GIN index, ranked by `ts_rank_cd` scaled
+by three priors: importance, a **type-dependent recency half-life** (a TASK is worthless after a
+month; a DECISION from a year ago may be the most important thing in the corpus), and a small type
+weight. Priors are multiplicative, so a memory that does not match the query scores zero however
+important it is.
+
+The weights are **untuned and labelled as such**. Milestone 6 builds the evaluation harness; tuning
+them now would mean fitting numbers to intuition and then building the ruler that agrees.
+
+Two findings worth keeping:
+
+- `is_current IS TRUE` makes the partial index **unusable** — PostgreSQL cannot prove it implies
+  `WHERE is_current`, because `IS TRUE` is null-safe and therefore a different expression. The bare
+  column works. Guarded by a test on the compiled SQL, since neither a latency test nor a plan
+  assertion catches it reliably.
+- The English stemmer maps `queue`/`queues`/`queueing` to one lexeme but `queued` to another, so
+  that query misses. Pinned as a failing case rather than described in prose — it is the honest
+  argument for semantic retrieval, and Milestone 6 will measure what it costs.
+
+Measured at 10k memories (`docs/perf/`): **1.8–5.5 ms** inside PostgreSQL. Client-observed p50 is
+7–17 ms; the gap is Docker Desktop port forwarding, not query cost, which is why the benchmark
+asserts both separately rather than hiding the overhead in one number.
 
 Metrics are an in-process registry that enforces the label-cardinality rule (`memory_id` and
 `project_id` are refused as labels). There is no OTLP exporter: the server is a short-lived

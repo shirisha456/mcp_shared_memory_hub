@@ -188,3 +188,6 @@ class SearchResult:
     Reported so a caller can tell "there are only 3 matches" apart from "there
     are 300 and you are seeing the first 10".
     """
+
+    def returned_count(self) -> int:
+        return len(self.memories)

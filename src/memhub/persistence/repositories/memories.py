@@ -13,13 +13,14 @@ import datetime as dt
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memhub.domain.enums import AuthorKind, MemoryStatus, MemoryType
 from memhub.domain.models import MemoryView
 from memhub.persistence.models import Memory, MemoryRevision
 from memhub.persistence.sql import CAS_REVISE, load
+from memhub.retrieval import lexical, ranking
 from memhub.retrieval.filters import current_revisions
 
 
@@ -125,10 +126,10 @@ class MemoryRepository:
             # Array containment: the memory must carry ALL requested tags.
             stmt = stmt.where(MemoryRevision.tags.contains(list(tags)))
         if query:
-            # Milestone 1 is substring matching only, and deliberately so.
-            # Full-text ranking arrives in Milestone 5, after the evaluation
-            # harness exists to prove it is actually an improvement.
-            stmt = stmt.where(MemoryRevision.content.ilike(f"%{query}%"))
+            # Full-text against the stored generated column, so the partial GIN
+            # index does the work. Computing to_tsvector() here instead would
+            # force a sequential scan over every current revision.
+            stmt = stmt.where(lexical.matches(query))
         return stmt
 
     async def count(
@@ -157,14 +158,74 @@ class MemoryRepository:
         stmt = self._apply_filters(
             current_revisions(project_id), query=query, types=types, tags=tags
         )
-        # Deterministic total ordering. The trailing id is not decoration: without
-        # it, rows tying on importance and timestamp come back in whatever order
-        # the plan produced, which makes results unstable between identical calls
-        # and impossible to snapshot-test.
-        stmt = stmt.order_by(Memory.importance.desc(), Memory.created_at.desc(), Memory.id).limit(
-            limit
+
+        # Two orderings, because the question is different in each case.
+        #
+        # With a query, rank by lexical relevance scaled by the priors: how well
+        # does this answer what was asked, adjusted for how much it matters and
+        # how likely it is still true.
+        #
+        # Without one, there is nothing to be relevant *to* - the caller is
+        # browsing. Importance then recency is the only sensible order.
+        #
+        # The trailing id is not decoration in either branch. Without it, rows
+        # tying on score come back in whatever order the plan produced, which
+        # makes results unstable between identical calls and impossible to
+        # snapshot-test.
+        if query:
+            stmt = stmt.order_by(
+                ranking.final_score(lexical.relevance(query)).desc(),
+                Memory.created_at.desc(),
+                Memory.id,
+            )
+        else:
+            stmt = stmt.order_by(Memory.importance.desc(), Memory.created_at.desc(), Memory.id)
+
+        return [(row[0], row[1]) for row in (await self._session.execute(stmt.limit(limit))).all()]
+
+    async def explain_search(
+        self,
+        project_id: uuid.UUID,
+        *,
+        query: str,
+        limit: int = 10,
+        force_index: bool = False,
+    ) -> str:
+        """EXPLAIN ANALYZE for the ranked search path.
+
+        ``force_index`` disables sequential scans for the duration of the call,
+        then resets. That is not how the query runs in production - it is a way
+        to ask a different question: *can* the planner reach the index at all?
+
+        The distinction matters. A plan showing a sequential scan is ambiguous:
+        either the index is unreachable (a predicate written in a form that
+        defeats partial-index proving), or it is reachable and the planner
+        correctly judged a scan cheaper. Only the first is a bug, and only this
+        flag can tell them apart.
+        """
+        stmt = self._apply_filters(
+            current_revisions(project_id), query=query, types=None, tags=None
+        ).order_by(ranking.final_score(lexical.relevance(query)).desc(), Memory.id)
+
+        compiled = stmt.limit(limit).compile(
+            dialect=self._session.bind.dialect,
+            compile_kwargs={"literal_binds": True},
         )
-        return [(row[0], row[1]) for row in (await self._session.execute(stmt)).all()]
+
+        if not force_index:
+            rows = await self._session.execute(text(f"EXPLAIN ANALYZE {compiled}"))
+            return "\n".join(str(row[0]) for row in rows.all())
+
+        # Session-level SET with an explicit reset, not SET LOCAL. SET LOCAL only
+        # takes effect inside an explicit transaction block; outside one
+        # PostgreSQL raises a warning and silently ignores it, which produced an
+        # unchanged plan and a very confusing failure.
+        await self._session.execute(text("SET enable_seqscan = off"))
+        try:
+            rows = await self._session.execute(text(f"EXPLAIN ANALYZE {compiled}"))
+            return "\n".join(str(row[0]) for row in rows.all())
+        finally:
+            await self._session.execute(text("RESET enable_seqscan"))
 
     async def compare_and_set(
         self,

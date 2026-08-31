@@ -1,0 +1,14 @@
+Corpus: 10000 memories, combinatorially generated (seed 20260101)
+Budgets: server < 50.0ms, client warm p95 < 150.0ms
+
+'server' is PostgreSQL's own execution time - the design target, and the
+only part this project controls. 'cold' is the first call after a bulk
+load, reading from disk. The gap between server time and client p50 is
+Docker Desktop port forwarding on this development machine, not query
+cost; on a Linux CI runner the two are far closer.
+
+quiescence         matched=   50  server=  2.07ms  cold=  19.37ms  p50=  9.33ms  p95= 11.56ms
+advisory locks     matched=  685  server=  4.87ms  cold=  12.59ms  p50= 14.90ms  p95= 21.35ms
+postgresql         matched=  685  server=  3.13ms  cold=  11.88ms  p50= 13.36ms  p95= 18.52ms
+outbox table       matched=  738  server=  3.42ms  cold=  10.22ms  p50= 10.77ms  p95= 13.34ms
+retry              matched=  614  server=  2.82ms  cold=  10.50ms  p50=  9.91ms  p95= 12.83ms

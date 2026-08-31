@@ -62,5 +62,17 @@ def current_revisions(
     return stmt.where(
         Memory.status == MemoryStatus.ACTIVE.value,
         or_(Memory.expires_at.is_(None), Memory.expires_at > func.now()),
-        MemoryRevision.is_current.is_(True),
+        # NOTE: bare `is_current`, NOT `.is_(True)`.
+        #
+        # This looks like a style preference and is not. The full-text index is
+        # partial - `... WHERE is_current` - and PostgreSQL will only use it if
+        # it can prove the query's predicate implies the index's. It proves that
+        # for a bare boolean, but *not* for `is_current IS TRUE`, because IS TRUE
+        # is null-safe and therefore not the same expression.
+        #
+        # Written the other way, the planner silently falls back to a sequential
+        # scan over every current revision. Verified: at 20k rows, `IS TRUE`
+        # produced a Seq Scan and the bare column produced a Bitmap Index Scan.
+        # tests/perf asserts on the plan for exactly this reason.
+        MemoryRevision.is_current,
     )

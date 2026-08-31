@@ -184,3 +184,16 @@ async def db_connection(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
 async def db_session(db_connection: AsyncConnection) -> AsyncIterator[AsyncSession]:
     async with AsyncSession(bind=db_connection, expire_on_commit=False) as session:
         yield session
+
+
+@pytest.fixture
+async def committing_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    """A session whose commits are real.
+
+    The rollback fixtures above are the right default, but some tests need data
+    to outlive a single transaction - a benchmark that seeds a corpus and then
+    measures repeated reads against it, for instance. Isolation for those comes
+    from the module-scoped database being dropped afterwards.
+    """
+    async with AsyncSession(bind=engine, expire_on_commit=False) as session:
+        yield session
