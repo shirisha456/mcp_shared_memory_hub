@@ -24,6 +24,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from memhub.config import get_settings
+from memhub.persistence import models  # noqa: F401  (registers tables on Base.metadata)
 from memhub.persistence.base import Base
 
 config = context.config

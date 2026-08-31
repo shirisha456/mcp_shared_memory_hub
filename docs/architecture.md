@@ -224,6 +224,16 @@ memory_history(project_id, memory_id)
 
 **(a) Conflicts are tool results, not protocol errors.** A JSON-RPC error means *the request was invalid or the server broke*. A version conflict means *the request was well-formed and the domain said no*. Returning it as a protocol error hides it from the model, which then cannot recover. We return `isError: true` with a **structured payload containing the current revision and content**, so the model has everything it needs to merge and retry in a single round trip. Malformed input, unknown project, and internal failure get protocol-level errors.
 
+**Amendment (Milestone 1, implementation finding).** The v2 SDK's `ToolError`
+carries a message string only; `is_error` and `structured_content` are mutually
+exclusive in practice, so "`isError: true` *with* a structured payload" is not
+expressible. Revision conflicts will therefore be returned as **ordinary results
+carrying `outcome: "conflict"`** alongside the current revision and content.
+This is arguably better than the original design: it forces the discriminator
+into the success schema, so every caller must acknowledge that a write can
+resolve in more than one way. Tool errors remain the mechanism for caller
+mistakes — unknown project, invalid input.
+
 **(b) Tool descriptions are production surface, not documentation.** The description string is what steers the model. Ours carry the operating contract:
 
 - "Never store credentials, API keys, or `.env` contents."

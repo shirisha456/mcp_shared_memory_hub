@@ -16,11 +16,14 @@ dependencies = [
     "alembic>=1.14.0",
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
+    "mcp>=2.1.1",
 ]
 
-# NOTE: the MCP SDK is deliberately NOT a dependency yet. It arrives in Milestone 1,
-# where the exact current package name and version will be verified against official
-# docs rather than guessed here.
+# mcp 2.1.1 verified against PyPI at Milestone 1, not assumed: v2 renamed
+# FastMCP to MCPServer, so code written from v1 tutorials does not run here.
+
+[project.scripts]
+memhub-server = "memhub.mcp.__main__:main"
 
 [project.optional-dependencies]
 dev = [
@@ -107,5 +110,6 @@ addopts = "-ra --strict-markers --strict-config"
 markers = [
     "integration: requires a real PostgreSQL instance",
     "concurrency: exercises real concurrent database access",
+    "stdio: spawns the server as a subprocess and talks over real stdio",
 ]
 filterwarnings = ["error"]

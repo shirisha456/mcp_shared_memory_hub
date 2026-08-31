@@ -1,0 +1,244 @@
+"""ORM models.
+
+The invariants from the architecture document (section 13) are expressed here as
+constraints and indexes, not as application logic. Nine of the fourteen are
+enforced by the schema, which means they survive a bug in the service layer.
+
+The two that most deserve attention:
+
+``uq_memory_revisions_memory_id`` (partial, ``WHERE is_current``)
+    At most one current revision per logical memory. Even if the Milestone 2
+    compare-and-set were written wrongly, a second current revision raises
+    ``23505`` rather than corrupting the corpus.
+
+``fk_memories_superseded_by_id_project_id_memories`` (composite)
+    A memory may only be superseded by a memory in the *same project*.
+    Cross-project contamination is not prevented by a ``WHERE`` clause someone
+    might forget - it is unrepresentable.
+
+Deliberately absent until their milestones: ``content_tsv`` and its GIN index
+(Milestone 5), ``memory_dedup_keys`` (3), ``idempotency_keys`` (2),
+``memory_attestations`` (3), ``memory_embeddings`` and ``embedding_jobs`` (7),
+``audit_events`` (2).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import uuid
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    LargeBinary,
+    SmallInteger,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, TIMESTAMP, UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from memhub.persistence.base import Base
+
+_SLUG_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,62}[a-z0-9]$"
+_MEMORY_TYPES = "'DECISION','CONSTRAINT','FACT','TASK'"
+_MEMORY_STATUSES = "'ACTIVE','SUPERSEDED','DELETED'"
+_AUTHOR_KINDS = "'agent','human_confirmed','import'"
+
+
+class Project(Base):
+    """A memory namespace.
+
+    Identity is ``id``, a server-issued UUID, and nothing else. ``slug`` is a
+    stable human-facing key; git remotes and workspace paths are resolution
+    aliases held in :class:`ProjectAlias`.
+    """
+
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    slug: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    archived_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("slug"),
+        CheckConstraint(f"slug ~ '{_SLUG_PATTERN}'", name="slug_format"),
+    )
+
+
+class ProjectAlias(Base):
+    """A resolution hint, never an identity.
+
+    The unique index spans ``(kind, value_norm)`` **globally** rather than
+    per-project. That is the point: an alias value can then never resolve to two
+    projects, so ambiguous resolution is impossible by construction rather than
+    by careful query writing.
+    """
+
+    __tablename__ = "project_aliases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    value_norm: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        UniqueConstraint("kind", "value_norm"),
+        CheckConstraint("kind IN ('git_remote','workspace_path')", name="kind_known"),
+        Index("ix_project_aliases_project_id", "project_id"),
+    )
+
+
+class Memory(Base):
+    """The logical fact: identity and lifecycle only, never content.
+
+    Mutable, but only in its lifecycle columns. All content lives in the
+    append-only :class:`MemoryRevision` log.
+    """
+
+    __tablename__ = "memories"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False
+    )
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'ACTIVE'"))
+    current_revision_no: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    importance: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("50"))
+    expires_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    superseded_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    deleted_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        # Required so child tables can carry a composite FK that pins the project.
+        UniqueConstraint("id", "project_id"),
+        # Namespace isolation as a schema fact: superseding across projects
+        # cannot be expressed. Nullable superseded_by_id means MATCH SIMPLE
+        # skips the check while the column is NULL, which is what we want.
+        ForeignKeyConstraint(
+            ["superseded_by_id", "project_id"],
+            ["memories.id", "memories.project_id"],
+        ),
+        CheckConstraint(f"type IN ({_MEMORY_TYPES})", name="type_known"),
+        CheckConstraint(f"status IN ({_MEMORY_STATUSES})", name="status_known"),
+        CheckConstraint("current_revision_no >= 1", name="revision_positive"),
+        CheckConstraint("importance BETWEEN 0 AND 100", name="importance_range"),
+        CheckConstraint("superseded_by_id IS DISTINCT FROM id", name="no_self_supersede"),
+        CheckConstraint(
+            "(status = 'SUPERSEDED') = (superseded_at IS NOT NULL)",
+            name="superseded_consistent",
+        ),
+        CheckConstraint(
+            "status <> 'SUPERSEDED' OR superseded_by_id IS NOT NULL",
+            name="superseded_has_target",
+        ),
+        CheckConstraint(
+            "(status = 'DELETED') = (deleted_at IS NOT NULL)", name="deleted_consistent"
+        ),
+        # The one type with a mandatory expiry. Without this, "currently
+        # implementing X" outlives the work it describes.
+        CheckConstraint("type <> 'TASK' OR expires_at IS NOT NULL", name="task_needs_ttl"),
+        Index(
+            "ix_memories_project_id_type_importance",
+            "project_id",
+            "type",
+            text("importance DESC"),
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+        Index(
+            "ix_memories_expires_at",
+            "expires_at",
+            postgresql_where=text("expires_at IS NOT NULL AND status = 'ACTIVE'"),
+        ),
+        Index(
+            "ix_memories_superseded_by_id",
+            "superseded_by_id",
+            postgresql_where=text("superseded_by_id IS NOT NULL"),
+        ),
+    )
+
+
+class MemoryRevision(Base):
+    """Immutable content. Append-only: never updated, never deleted.
+
+    ``PRIMARY KEY (memory_id, revision_no)`` is doing real work - it makes two
+    concurrent writers unable to both create revision N, independently of
+    whatever the service layer believes.
+    """
+
+    __tablename__ = "memory_revisions"
+
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    revision_no: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Denormalised so the composite FK below can pin the project, and so
+    # project-scoped scans need no join.
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    hash_version: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("1")
+    )
+    tags: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
+    )
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    change_reason: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str | None] = mapped_column(Text)
+    author_client: Mapped[str] = mapped_column(Text, nullable=False)
+    author_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["memory_id", "project_id"],
+            ["memories.id", "memories.project_id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("revision_no >= 1", name="revision_positive"),
+        CheckConstraint("length(content) BETWEEN 1 AND 8192", name="content_length"),
+        CheckConstraint("cardinality(tags) <= 16", name="tags_bounded"),
+        CheckConstraint(f"author_kind IN ({_AUTHOR_KINDS})", name="author_kind_known"),
+        # INVARIANT 1: exactly one current revision per logical memory.
+        Index(
+            "uq_memory_revisions_memory_id",
+            "memory_id",
+            unique=True,
+            postgresql_where=text("is_current"),
+        ),
+        Index("ix_memory_revisions_project_id", "project_id"),
+    )
