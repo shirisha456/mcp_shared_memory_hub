@@ -1,21 +1,30 @@
 # MCP Shared Memory Hub
 
-You spend twenty minutes explaining to an AI assistant why the job queue is PostgreSQL
-`SKIP LOCKED` and not Redis. It follows the reasoning and writes good code. Then the session ends
-and it is gone. You open Cursor instead of Claude Desktop and explain it again. So you write it
-down in a markdown file — and months later that file still says Redis, the assistant reads it, and
-now it is confidently wrong about your own architecture.
+**Monday.** You spend twenty minutes explaining to an AI assistant why the background job queue
+should be Redis. It follows the reasoning and writes good code.
 
-Three separate failures:
+**Tuesday.** New session. The assistant remembers none of it, so you explain it again. Later you
+open Cursor instead of Claude Desktop, which never saw either conversation, and explain it a third
+time.
+
+So you write the decision down in a markdown file and point both tools at it. That works.
+
+**Six months later.** You have since dropped Redis — PostgreSQL `SKIP LOCKED` does the same job with
+one less service to run and transactions for free. The code changed. The file did not. The assistant
+reads it, tells you your queue is Redis, and it sounds exactly as authoritative as everything else
+it says.
+
+Three separate failures, and only one of them is hard:
 
 - **Amnesia.** What you explained lives in a transcript that dies with the session.
 - **Fragmentation.** Each client keeps its own memory, or none, and they never meet.
-- **Staleness.** The obvious fix — notes in a file — rots silently. Nothing retracts a decision that
-  was reversed, so the model repeats it with total confidence.
+- **Staleness.** Written-down knowledge rots. Nothing retracts a decision once it is reversed, so
+  the model repeats it with total confidence — and a confidently wrong answer is worse than no
+  answer, because you stop checking.
 
-The third is the hard one, and it is the one most memory projects skip. Storing facts is easy;
-*retiring* them, so that a superseded decision can never surface again no matter how it is searched
-for, is a data-modelling and retrieval problem. Most of this repository is about that.
+Storing facts is easy. *Retiring* them — so that a reversed decision can never surface again, no
+matter how someone searches for it — is a data-modelling and retrieval problem. Most of this
+repository is about that third bullet.
 
 **What it does.** One PostgreSQL database that any number of MCP clients read and write through:
 conflict-safe updates, immutable revision history with supersession, hybrid keyword + vector
@@ -31,7 +40,7 @@ Measured rather than asserted — a hand-graded dataset of 34 queries, re-scored
 
 That last column is the point. A retired memory reached a caller **zero** times — at every token
 budget, for every query, through two complete rewrites of the retrieval layer — because suppression
-lives in a filter that every retrieval path is built on, rather than in ranking, where a good enough
+lives in a filter that every retrieval path is built on, rather than in ranking, where a high enough
 score could always outvote it.
 
 **Status: complete through failure handling and scaling.** Seven MCP tools over stdio, backed by
