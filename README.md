@@ -9,9 +9,9 @@
 
 ---
 
-## Why this is hard
+## The problem
 
-A single AI assistant remembering things isn't hard — that's a text file. It gets hard the moment several different clients share the same memory:
+Giving one AI assistant a memory isn't hard — it's just a text file the assistant reads. It gets hard the moment several different clients need to share that same memory:
 
 - Two clients can try to update the same fact at the same time.
 - A decision can be reversed, and the reversal has to take effect everywhere, immediately.
