@@ -46,15 +46,11 @@ Each client spawns its **own** copy of the server as a subprocess — they share
 
 **What this server actually sees:** the arguments of the tool calls made to it — nothing more. It does not receive conversation transcripts, and it has no access to a client's chat history. This is a *shared memory system*: clients explicitly decide what's worth recording. It is not, and will never be, a transparent chat-history synchronisation system.
 
-## This is not a RAG wrapper
+## Why vector search alone isn't enough
 
-The easy version of this project is: embed a memory, store the vector, run nearest-neighbour search. That version breaks the moment a memory is revised, because nothing stops the old embedding from still being the closest match.
+Embedding a memory, storing the vector, and running nearest-neighbour search gets you a working prototype quickly. It also breaks the moment a memory is revised, because nothing about that approach stops the old embedding from still being the closest match to a new query.
 
-| A basic RAG demo | This project |
-|---|---|
-| documents → embeddings → vector DB → search → LLM | multiple clients → conflict-safe writes → immutable revisions → supersession → hybrid retrieval → structural stale-memory exclusion → token-budgeted context → MCP |
-
-The difference isn't the vector database. It's the layer above it that guarantees a retired fact cannot come back.
+What sits above the vector database is what makes revision safe: conflict-safe writes, immutable revisions, supersession, and a structural filter that excludes retired memories before ranking ever runs — all wrapped in one hybrid retrieval path and exposed over MCP.
 
 ## Revision history and supersession
 
