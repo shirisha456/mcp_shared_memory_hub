@@ -77,6 +77,10 @@ ignore = [
 # Alembic templates are generated; migrations are intentionally terse.
 "migrations/*" = ["N999", "B"]
 
+# A script a human runs directly in a terminal, not a subprocess whose stdout
+# is parsed as protocol - the T20 ban exists for the server package, not this.
+"demo.py" = ["T201"]
+
 # ---------------------------------------------------------------------------
 # mypy
 # ---------------------------------------------------------------------------
