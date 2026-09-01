@@ -170,7 +170,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memhub-admin",
         description=(
-            "Operator commands for the memory hub. These are not exposed over "
+            "Operator commands for the memory server. These are not exposed over "
             "MCP: purge destroys content irreversibly, which is not something a "
             "language model should be able to do on its own reading of a request."
         ),

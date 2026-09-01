@@ -1,4 +1,4 @@
-# MCP Shared Memory Hub — Architecture
+# MCP Shared Memory Server — Architecture
 
 **Status:** v0.2 — **LOCKED**. Implementation in progress (Milestone 0).
 Changes to this document from here require an implementation finding that reveals a genuinely missing decision. See §19.
@@ -1187,7 +1187,7 @@ Nine of fourteen are schema-level. That ratio is the point.
 ## 14. Repository structure
 
 ```
-mcp_shared_memory_hub/
+mcp_shared_memory_server/
   src/memhub/
     domain/          models.py enums.py errors.py invariants.py   # pure, no I/O
     services/        projects.py remember.py revise.py forget.py

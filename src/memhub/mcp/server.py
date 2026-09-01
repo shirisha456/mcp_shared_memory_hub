@@ -108,7 +108,7 @@ def build_server(
     server = MCPServer(
         name=name,
         version=version,
-        title="MCP Shared Memory Hub",
+        title="MCP Shared Memory Server",
         instructions=SERVER_INSTRUCTIONS,
     )
 

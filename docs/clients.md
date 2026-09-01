@@ -23,7 +23,7 @@ python -c "import shutil; print(shutil.which('memhub-server'))"
 ```
 
 In this repository's virtual environment that is
-`C:\Users\<you>\mcp_shared_memory_hub\.venv\Scripts\memhub-server.exe`.
+`C:\Users\<you>\mcp_shared_memory_server\.venv\Scripts\memhub-server.exe`.
 
 ---
 
@@ -38,7 +38,7 @@ Settings → Developer → **Edit Config**, which opens:
 {
   "mcpServers": {
     "memhub": {
-      "command": "C:\\Users\\you\\mcp_shared_memory_hub\\.venv\\Scripts\\memhub-server.exe",
+      "command": "C:\\Users\\you\\mcp_shared_memory_server\\.venv\\Scripts\\memhub-server.exe",
       "env": {
         "MEMHUB_DATABASE_URL": "postgresql+asyncpg://memhub:memhub@localhost:5435/memhub"
       }
@@ -53,7 +53,7 @@ macOS:
 {
   "mcpServers": {
     "memhub": {
-      "command": "/Users/you/mcp_shared_memory_hub/.venv/bin/memhub-server",
+      "command": "/Users/you/mcp_shared_memory_server/.venv/bin/memhub-server",
       "env": {
         "MEMHUB_DATABASE_URL": "postgresql+asyncpg://memhub:memhub@localhost:5435/memhub"
       }
@@ -79,7 +79,7 @@ Cursor's schema differs from Claude Desktop's in one respect: it takes an explic
   "mcpServers": {
     "memhub": {
       "type": "stdio",
-      "command": "C:\\Users\\you\\mcp_shared_memory_hub\\.venv\\Scripts\\memhub-server.exe",
+      "command": "C:\\Users\\you\\mcp_shared_memory_server\\.venv\\Scripts\\memhub-server.exe",
       "env": {
         "MEMHUB_DATABASE_URL": "postgresql+asyncpg://memhub:memhub@localhost:5435/memhub"
       }
@@ -96,8 +96,8 @@ Cursor also supports `envFile` for stdio servers, so the connection string can l
   "mcpServers": {
     "memhub": {
       "type": "stdio",
-      "command": "C:\\Users\\you\\mcp_shared_memory_hub\\.venv\\Scripts\\memhub-server.exe",
-      "envFile": "C:\\Users\\you\\mcp_shared_memory_hub\\.env"
+      "command": "C:\\Users\\you\\mcp_shared_memory_server\\.venv\\Scripts\\memhub-server.exe",
+      "envFile": "C:\\Users\\you\\mcp_shared_memory_server\\.env"
     }
   }
 }

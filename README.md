@@ -1,8 +1,8 @@
-# MCP Shared Memory Hub
+# MCP Shared Memory Server
 
 **A PostgreSQL-backed memory service that lets multiple MCP clients share, revise, and search a project's knowledge without ever resurfacing a decision that has been replaced.**
 
-[![CI](https://github.com/shirisha456/mcp_shared_memory_hub/actions/workflows/ci.yml/badge.svg)](https://github.com/shirisha456/mcp_shared_memory_hub/actions/workflows/ci.yml)
+[![CI](https://github.com/shirisha456/mcp_shared_memory_server/actions/workflows/ci.yml/badge.svg)](https://github.com/shirisha456/mcp_shared_memory_server/actions/workflows/ci.yml)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![PostgreSQL 16 + pgvector](https://img.shields.io/badge/postgres-16%20%2B%20pgvector-336791)
 ![369 tests](https://img.shields.io/badge/tests-369%20passing-brightgreen)

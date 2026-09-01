@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "memhub"
 version = "0.1.0"
-description = "MCP Shared Memory Hub - a persistent, versioned, conflict-safe shared memory service for MCP-compatible AI clients."
+description = "MCP Shared Memory Server - a persistent, versioned, conflict-safe shared memory service for MCP-compatible AI clients."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
