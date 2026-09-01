@@ -9,11 +9,11 @@
 
 ---
 
-## Why this is hard
+## The problem
 
 Developers don't use just one AI coding tool. Someone explains a decision to Claude Desktop, then switches to Cursor for a different task — and Cursor has no idea what was just decided, because it never saw that conversation. Every tool starts from zero, every time.
 
-Giving one AI assistant a memory is easy — a text file it can read. Giving **several different clients** a memory they all share is a different problem, because now:
+The fix sounds simple: give every tool one shared place to read and write project knowledge. Giving one AI assistant a memory *is* simple — a text file it can read. Sharing that memory correctly across **several different clients** is where it gets hard, because now:
 
 - two clients can try to update the same fact **at the same time**
 - a decision made last month can be **reversed**, and the reversal has to actually take effect everywhere
@@ -23,7 +23,13 @@ Giving one AI assistant a memory is easy — a text file it can read. Giving **s
 - whatever gets retrieved has to fit inside a **token budget**, not just be sorted by relevance
 - every client has to reach all of this through the **same protocol**, not a bespoke integration each
 
-Storing a fact is a CRUD operation. Correctly *retiring* one — so it can never come back, however it's searched for, while still remaining in the audit trail — is a concurrency and retrieval problem. That is what this project is actually about.
+Storing a fact is easy. Correctly *retiring* one — so it can never come back, however it's searched for, while still remaining in the audit trail — is a concurrency and retrieval problem.
+
+## What this project solves
+
+Every MCP client reads and writes one shared, versioned memory. Two clients writing at once are resolved safely, not silently overwritten. When a fact is replaced, the old version is marked as replaced in the same transaction as the new one — it stays fully readable in the audit history, but it can never come back as a search result again.
+
+That last guarantee is structural, not a ranking decision: a replaced fact is excluded from retrieval *before* any scoring runs, so no query and no similarity match can bring it back.
 
 ## Architecture
 
