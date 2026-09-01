@@ -1,184 +1,294 @@
 # MCP Shared Memory Hub
 
-**An MCP server that gives AI coding assistants a shared, persistent memory of your project.**
+**A PostgreSQL-backed memory service that lets multiple MCP clients share, revise, and search a project's knowledge without ever resurfacing a decision that has been replaced.**
 
-Claude Desktop, Cursor, and any other MCP client read from and write to a single PostgreSQL-backed
-store. What you tell one assistant outlives the session and is available to the next one. When a
-decision is reversed, the superseded version stops being returned.
+[![CI](https://github.com/shirisha456/mcp_shared_memory_hub/actions/workflows/ci.yml/badge.svg)](https://github.com/shirisha456/mcp_shared_memory_hub/actions/workflows/ci.yml)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
+![PostgreSQL 16 + pgvector](https://img.shields.io/badge/postgres-16%20%2B%20pgvector-336791)
+![369 tests](https://img.shields.io/badge/tests-369%20passing-brightgreen)
 
-## The problem
+---
 
-**Monday.** You spend twenty minutes explaining to an AI assistant why the background job queue
-should run on Redis. It follows the reasoning and writes good code.
+## Why this is hard
 
-**Tuesday.** A new session begins, and the assistant remembers none of it, so you explain the
-decision again. Later you switch to Cursor, which never saw either conversation, and explain it a
-third time.
+Giving one AI assistant a memory is easy — a text file it can read. Giving **several different clients** a memory they all share is a different problem, because now:
 
-So you write the decision down in a markdown file and point both tools at it. That works.
+- two clients can try to update the same fact **at the same time**
+- a decision made last month can be **reversed**, and the reversal has to actually take effect everywhere
+- the old decision still needs to be **auditable** — someone will ask why it changed
+- if the old and new versions are both left retrievable, a similarity search can return the **wrong one**, because the retired phrasing often matches the query better than the current answer does
+- lexical and semantic search each miss things the other catches, so neither alone is enough
+- whatever gets retrieved has to fit inside a **token budget**, not just be sorted by relevance
+- every client has to reach all of this through the **same protocol**, not a bespoke integration each
 
-**Six months later.** You have replaced Redis with PostgreSQL, which was already running and can do
-the same job with one fewer service to keep alive. You update the code. Nobody remembers the file.
+Storing a fact is a CRUD operation. Correctly *retiring* one — so it can never come back, however it's searched for, while still remaining in the audit trail — is a concurrency and retrieval problem. That is what this project is actually about.
 
-So the assistant reads that file and tells you the queue runs on Redis. It is wrong, and it sounds
-exactly as certain as it does when it is right. That is what makes it expensive: nothing marks the
-answer as out of date, so you have no reason to double-check it.
+## Architecture
 
-Three separate failures, and only one of them is hard:
+```mermaid
+flowchart TD
+    C1["Claude Desktop<br/>(own server process)"] -->|stdio / JSON-RPC| S
+    C2["Cursor<br/>(own server process)"] -->|stdio / JSON-RPC| S
+    C3["any other MCP client"] -->|stdio / JSON-RPC| S
 
-- **Amnesia.** What you explained lives in a transcript that dies with the session.
-- **Fragmentation.** Each client keeps its own memory, if it keeps one at all, and those memories
-  never meet.
-- **Staleness.** Written knowledge rots. Nothing retracts a decision once it has been reversed, so
-  the model repeats it with full confidence — and a confidently wrong answer is worse than no
-  answer, because it stops you from checking.
+    S["memhub-server<br/>7 MCP tools"] --> SVC["Service layer<br/>CAS revise · dedup · idempotency"]
+    SVC --> PG[("PostgreSQL<br/>memories · revisions · outbox")]
 
-Storing facts is easy. Retiring them is not. Guaranteeing that a reversed decision can never surface
-again, however someone searches for it, is a problem of data modelling and retrieval, and that third
-failure is what most of this repository addresses.
+    PG --> FTS["Full-text search<br/>tsvector + GIN"]
+    PG --> VEC["pgvector<br/>HNSW, cosine distance"]
+    FTS --> RRF["Reciprocal Rank Fusion"]
+    VEC --> RRF
+    RRF --> FILTER["Stage-0 filter<br/>excludes superseded / deleted / expired"]
+    FILTER --> BUDGET["Token-budgeted context<br/>quotas + MMR + knapsack fill"]
+```
 
-## What it does
+Each client spawns its **own** copy of the server as a subprocess — they share no memory and no cache. PostgreSQL is the only channel between them, which is what makes the concurrency control below a real requirement rather than a nice-to-have.
 
-The server provides conflict-safe updates, immutable revision history with supersession, hybrid
-keyword and vector retrieval, and recall that fits within a token budget the caller specifies.
+**What this server actually sees:** the arguments of the tool calls made to it — nothing more. It does not receive conversation transcripts, and it has no access to a client's chat history. This is a *shared memory system*: clients explicitly decide what's worth recording. It is not, and will never be, a transparent chat-history synchronisation system.
 
-Retrieval quality is measured rather than asserted, against a hand-graded dataset of 34 queries that
-is re-scored on every change:
+## This is not a RAG wrapper
 
-| Retrieval strategy | nDCG@10 | Stale memories returned |
+The easy version of this project is: embed a memory, store the vector, run nearest-neighbour search. That version breaks the moment a memory is revised, because nothing stops the old embedding from still being the closest match.
+
+| A basic RAG demo | This project |
+|---|---|
+| documents → embeddings → vector DB → search → LLM | multiple clients → conflict-safe writes → immutable revisions → supersession → hybrid retrieval → structural stale-memory exclusion → token-budgeted context → MCP |
+
+The difference isn't the vector database. It's the layer above it that guarantees a retired fact cannot come back.
+
+## Revision history and supersession
+
+Two distinct mechanisms, both immutable, and worth telling apart:
+
+- **`memory_revise`** creates a new revision **of the same memory** (revision 1 → 2 → 3...), guarded by compare-and-set. Use it to correct or extend a fact's wording.
+- **`memory_remember ... supersedes=[...]`** retires **one memory** and asserts a **new, separate one** in its place, in a single transaction. Use it when the decision itself changes.
+
+```mermaid
+sequenceDiagram
+    participant Cursor
+    participant DB as PostgreSQL
+
+    Note over Cursor,DB: Monday — a decision is recorded
+    Cursor->>DB: memory_remember(DECISION, "queue runs on Redis")
+    DB-->>Cursor: memory A, status=ACTIVE
+
+    Note over Cursor,DB: Six months later — the decision is reversed
+    Cursor->>DB: memory_remember(DECISION, "queue runs on PostgreSQL SKIP LOCKED", supersedes=[A])
+    DB-->>Cursor: memory B, status=ACTIVE
+
+    Note over DB: One transaction: A → SUPERSEDED, B → ACTIVE
+
+    Cursor->>DB: memory_search("redis")
+    DB-->>Cursor: only memory B — A is structurally excluded
+
+    Cursor->>DB: memory_history(A)
+    DB-->>Cursor: A, status=SUPERSEDED, superseded_by=B — still fully readable
+```
+
+The exclusion of `A` is not a ranking decision — a similarity search would happily return it, since it literally contains the word "Redis" and the replacement barely mentions it. It's a filter every retrieval path runs *before* ranking ever sees a candidate. `tests/integration/test_stale_memory.py` asserts this at every limit from 1 to 100, and mutation-testing the filter — removing the status condition — makes five of those tests fail.
+
+## Concurrent writes
+
+Two clients can read the same revision and try to update it at the same time. One has to win, and the other has to be told it lost — not silently overwritten.
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant B as Client B
+    participant DB as PostgreSQL
+
+    A->>DB: read memory, revision = 4
+    B->>DB: read memory, revision = 4
+    A->>DB: memory_revise(expected_revision=4)
+    DB-->>A: OK — now revision 5
+    B->>DB: memory_revise(expected_revision=4)
+    DB-->>B: outcome="conflict", current_revision=5, current_content=...
+```
+
+`memory_revise` is a single-statement compare-and-set:
+
+```sql
+UPDATE memories SET current_revision_no = current_revision_no + 1
+ WHERE id = :id AND project_id = :pid AND current_revision_no = :expected AND status = 'ACTIVE'
+```
+
+Zero rows updated means another writer already moved the revision forward. The correctness argument is `EvalPlanQual`: when a blocked transaction unblocks, PostgreSQL re-evaluates this `WHERE` clause against the newest committed row, so the read and the write happen as one statement — there is no window in which a second writer could have proceeded on stale information. `READ COMMITTED` is chosen deliberately over `SERIALIZABLE` for this: `SERIALIZABLE` would turn every losing writer's clean, informative refusal into an opaque `40001` retry.
+
+`tests/concurrency/` proves it directly: 50 writers launched from a barrier so they collide for real, exactly 1 succeeds and 49 receive a conflict with the winning revision attached, then the invariant suite confirms the database agrees. Removing the version predicate from the SQL is a one-line change that makes those tests fail — verified.
+
+**A separate mechanism handles the other half of correctness under concurrency.** Idempotency is *one* client retrying *the same request* after a dropped connection — keyed on a caller-supplied `client_request_id`, the retry replays the original stored response rather than writing twice. Deduplication is *two different clients* independently asserting *the same fact* — keyed on a normalised content hash, it returns the existing memory and records the second assertion as corroborating evidence, not a duplicate. They're easy to conflate and solve different problems; `tests/concurrency/test_idempotency.py` keeps them distinct.
+
+## Retrieval architecture
+
+Full-text search and pgvector similarity both run over the *same* stage-0 filter, then their rankings are combined by **Reciprocal Rank Fusion** — position, not score. `ts_rank_cd` is unbounded and corpus-dependent; cosine distance lives in `[0, 2]`. Adding the two numbers together is meaningless, and per-query normalisation is worse: it scales a mediocre best match up to 1.0, identically to a perfect one.
+
+| Mechanism | What it's for |
+|---|---|
+| PostgreSQL full-text search | exact terminology, identifiers, names — things a stemmer or embedding model can miss |
+| pgvector similarity | meaning without the exact words, e.g. `jwt` finding a memory that only says `JWTs` |
+| Reciprocal Rank Fusion | combining two rankings that live on incompatible scales, without inventing a shared one |
+| Stage-0 filter | structurally excludes superseded / deleted / expired memories, before ranking ever runs |
+| Token-budgeted context | keeps a caller's context window from being overrun, with per-type quotas and MMR diversity |
+
+Approximate nearest-neighbour search returns the *k* closest vectors whether or not anything is actually close, so a cosine-distance threshold (`0.35`) gates the semantic leg — chosen by sweeping against the corpus, not by intuition (see [`docs/eval/threshold-sweep.md`](docs/eval/threshold-sweep.md)). Without it, hybrid retrieval scored a better nDCG (0.881) while precision collapsed to 0.113, because every unanswerable query started returning ten confident-looking irrelevant results.
+
+## Retrieval quality — measured
+
+A hand-graded dataset of 200 memories and 34 queries, written **before** any retrieval strategy was measured against it. Numbers are gated against a committed baseline, so a regression fails the build rather than going unnoticed.
+
+| Strategy | nDCG@10 | Recall@10 | Precision@10 | Stale memories returned |
+|---|---|---|---|---|
+| Full-text, all terms required | 0.478 | 0.468 | 0.484 | 0.000 |
+| Full-text, any-term fallback | 0.803 | 0.817 | 0.691 | 0.000 |
+| Hybrid: FTS + pgvector, RRF | **0.853** | **0.828** | 0.671 | **0.000** |
+
+The last column is the point, not the first three. A retired memory reached a caller **zero** times, at every strategy, every token budget, and every query — including one built specifically to defeat a similarity-only system: searching `"redis"` when the retired memory is about Redis and the current answer mentions it only to say it was removed.
+
+The `jwt` query went from 0.000 (the Snowball stemmer never matches `JWTs`) to a perfect 1.000 under hybrid, because semantic similarity does bridge that gap. `deadlock prevention` stays at 0.000 either way — the matching memory describes deadlock prevention without ever using the phrase, and 384 dimensions of a small local model don't close that particular gap. Recorded as an open case, not smoothed over.
+
+## Consistency guarantees
+
+Precise claims only — no "strong consistency" without saying what that means here.
+
+- **A stale write can never overwrite the current revision.** Enforced by the compare-and-set above, not by application logic.
+- **Exactly one current revision per memory, at all times.** `UNIQUE (memory_id) WHERE is_current` — a database constraint, not a convention.
+- **Superseded, deleted, and expired memories never appear in normal retrieval**, from a single stage-0 predicate that every retrieval path runs through.
+- **A memory can only be superseded within its own project.** A composite foreign key makes cross-project supersession structurally unrepresentable, not merely disallowed.
+- **Every timestamp is the database's clock**, never an application clock — so there is no clock-skew window between processes to reason about.
+- **Content is never destroyed by a normal operation.** Revisions are append-only; the one destructive path (`memhub-admin purge`) is a separate, audited, human-invoked operator command, deliberately unreachable over MCP.
+
+9 of the 14 invariants in [`docs/architecture.md`](docs/architecture.md#13-invariants-enforced-not-documented) are enforced at the schema level, so they hold even if a bug reaches the service layer. `tests/integration/test_invariants.py` proves each one by bypassing the service layer entirely and attempting the forbidden write directly against the database.
+
+## Failure model
+
+Driver-level failures are classified into codes that say what to do next — the distinction between them is the point, not the count:
+
+| Code | Safe to retry | Because |
 |---|---|---|
-| Full-text, all terms required | 0.478 | 0.000 |
-| Full-text with any-term fallback | 0.803 | 0.000 |
-| Hybrid: full-text + pgvector, fused by RRF | **0.853** | **0.000** |
+| `BACKEND_UNAVAILABLE` | yes | the connection never opened; nothing ran |
+| `BACKEND_BUSY` | yes | the pool timed out before a statement was sent |
+| `UNKNOWN_OUTCOME` | **no** | the connection died mid-flight; the write may have committed |
+| `DEADLINE_EXCEEDED` | no | the query was too slow; the server itself is healthy |
 
-The last column matters more than the first. A retired memory reached a caller **zero** times, at
-every token budget and for every query, across two complete rewrites of the retrieval layer. It held
-because suppression happens in a filter that sits beneath every retrieval path, rather than in
-ranking, where a high enough score could outvote it.
+`UNKNOWN_OUTCOME` is the one genuinely ambiguous case: the transaction either committed just before the connection dropped, or it didn't, and the acknowledgement that would have said which is exactly what was lost. So the response doesn't claim the write failed — it names the two ways to find out: replay the idempotency key, or re-read. That branch ordering is mutation-tested: inverting it makes three tests fail, because it would report every mid-flight disconnect as safely retryable, which is how duplicate writes happen.
 
-**Status: complete through failure handling and scaling.** Seven MCP tools over stdio, backed by
-PostgreSQL, and 369 tests. See [`docs/architecture.md`](docs/architecture.md) for the full design,
-and [`docs/failure-modes.md`](docs/failure-modes.md) for every failure the design claims to handle,
-each mapped to the test that holds it up.
+[`docs/failure-modes.md`](docs/failure-modes.md) maps every failure the architecture claims to handle to the specific test that proves it, and states plainly which ones are structural arguments rather than tests — and why a test there would just be testing PostgreSQL.
 
----
+## Testing strategy
 
-## What this is, precisely
+369 tests, organized by what they're actually checking, not just counted:
 
-Claude Desktop and Cursor each spawn their **own** copy of this server as a subprocess. The two
-processes share no memory and no cache — PostgreSQL is the only shared state between them. That
-constraint is what makes the concurrency control in this project real rather than decorative.
+| Category | What it proves |
+|---|---|
+| `tests/unit/` | Domain logic in isolation — validation, token estimation, ranking math, no database |
+| `tests/integration/` | Real behaviour against real PostgreSQL — no mocked database anywhere in the suite |
+| `tests/concurrency/` | Conflicting writes are actually adjudicated: 50 real writers, exactly 1 winner |
+| `tests/failure/` | Driver failures classify correctly; schema drift is refused in both directions |
+| `tests/perf/` | Search latency and cost-vs-corpus-size, measured against a budget, not eyeballed |
+| `tests/protocol/` | The actual MCP stdio transport, spawned as a real subprocess — not an in-process shortcut |
+| `tests/eval/` | Retrieval quality against the graded dataset, gated against a committed baseline |
 
-An MCP server receives **the arguments of the tool calls made to it**. It does not receive
-transcripts. This is therefore a *shared memory system* — clients explicitly record what is worth
-keeping — and not a chat-history synchronisation system. Nothing in this repository will ever claim
-otherwise.
+A few tests worth naming specifically: the 50-writer compare-and-set test only passes for the right reason because a fixture first asserts the connection pool can supply 50 distinct backends — otherwise a 50-way test against a 10-connection pool just measures five sequential waves. The stage-0 filter and the failure classifier's branch order are both **mutation-tested**: the mechanism is deliberately broken, the relevant tests are confirmed to fail, then it's restored — the only real evidence a test was checking anything at all.
 
-## What it is not
+## Performance and scaling
 
-Not a chatbot, not a RAG platform, not a vector-database wrapper, not a notes CRUD app, not an
-issue tracker, not an MCP gateway, not an agent control plane.
+Measured at three corpus sizes, on a local Docker Desktop PostgreSQL instance, server time from `EXPLAIN ANALYZE` and client time including transport overhead:
 
-## Engineering focus
-
-Schema design and database-enforced invariants · optimistic concurrency control via single-statement
-compare-and-set · idempotent writes · immutable revisions with supersession · staged retrieval with
-a measured evaluation harness · an explicit failure model · real-PostgreSQL testing.
-
----
-
-## Quick start
-
-Start PostgreSQL (the image bundles pgvector, used for semantic search):
-
-```bash
-docker compose up -d --wait
+```
+  1,000 memories   server  0.36ms   client  5.34ms
+ 10,000 memories   server  0.53ms   client 11.00ms
+100,000 memories   server  0.67ms   client 22.80ms
 ```
 
-Install the package with development dependencies:
+Corpus grew 100×; server-side query time grew 1.9×. The gap between server and client time is Docker Desktop's port forwarding, not query cost — the benchmark reports both separately rather than folding the overhead into one misleading number. At 100,000 rows the planner still chooses a sequential scan over the GIN index, correctly: with `LIMIT 10`, the scan stops as soon as it has ten matches, before an index lookup plus heap fetches would have paid for themselves — recorded in [`docs/perf/scaling_plan.txt`](docs/perf/scaling_plan.txt) rather than asserted on, after two earlier versions of this benchmark asserted the wrong thing.
 
-```bash
-pip install -e ".[dev]"
-```
+This measures one selective query at three corpus sizes on one machine — it demonstrates sub-linear growth for that query shape, not a general scalability claim.
 
-Apply migrations:
+## MCP protocol and tool surface
 
-```bash
-alembic upgrade head
-```
-
-Run the checks:
-
-```bash
-ruff check . && ruff format --check . && mypy && pytest -v
-```
-
-Integration tests skip with an actionable message if PostgreSQL is unreachable. In CI,
-`MEMHUB_REQUIRE_DB=1` turns that skip into a failure so a broken service container cannot be
-mistaken for a green build.
-
-## Configuration
-
-Every setting is declared in [`src/memhub/config.py`](src/memhub/config.py); nothing reads
-`os.environ` directly. Override via environment variables prefixed `MEMHUB_`, or a `.env` file —
-see [`.env.example`](.env.example).
-
-## Connecting a client
-
-Full setup for both clients, with verified config formats and troubleshooting, is in
-[docs/clients.md](docs/clients.md). The short version — note the **absolute path**, since neither
-client runs the server from your project directory and Cursor's config has no `cwd` field:
-
-```json
-{
-  "mcpServers": {
-    "memhub": {
-      "command": "C:\\Users\\you\\mcp_shared_memory_hub\\.venv\\Scripts\\memhub-server.exe",
-      "env": {
-        "MEMHUB_DATABASE_URL": "postgresql+asyncpg://memhub:memhub@localhost:5435/memhub"
-      }
-    }
-  }
-}
-```
-
-Claude Desktop reads `%APPDATA%\Claude\claude_desktop_config.json`; Cursor reads
-`~/.cursor/mcp.json` or `.cursor/mcp.json`, and also requires `"type": "stdio"`.
-
-Point both at the **same** `MEMHUB_DATABASE_URL`. Each client spawns its own server process, and
-those processes share nothing else — no memory, no cache, no files. Give them different URLs and
-everything will still appear to work, while each client quietly keeps a private corpus of its own.
-
-## Tool surface
+[MCP](https://modelcontextprotocol.io) gives an AI client a standard way to discover and call tools exposed by a separate process. It's the transport; the engineering in this repository is the memory-consistency, revision, retrieval, and concurrency layer sitting behind it; the seven tools below are a thin surface over the service layer described above.
 
 | Tool | Purpose |
 |---|---|
 | `project_use` | Resolve or explicitly create a project namespace. Never creates implicitly. |
-| `memory_remember` | Record one durable piece of project knowledge. |
+| `memory_remember` | Record one durable piece of knowledge; optionally `supersedes` an earlier one. |
 | `memory_revise` | Update a memory, guarded by `expected_revision`. A conflict returns the winning version, not an error. |
-| `memory_forget` | Tombstone a memory. Reversible; content is never destroyed. |
-| `memory_search` | Retrieve active memories. Superseded, deleted and expired are never returned. |
-| `memory_history` | Full record for one memory, including retired ones: revisions, lineage, attestations, audit. |
-| `memory_context` | The most useful brief that fits a token budget. Not search — selection under a constraint. |
+| `memory_forget` | Tombstone a memory. Reversible — content is never destroyed. |
+| `memory_search` | Retrieve active memories. Superseded, deleted, and expired are never returned. |
+| `memory_history` | Full record for one memory, including retired ones: revisions, lineage, audit. |
+| `memory_context` | The most useful brief that fits a token budget — selection under a constraint, not search. |
 
-Plus three read-only resources — identity-addressed and side-effect free, which is what makes them
-resources rather than tools:
+The manifest — names, descriptions, schemas — is snapshotted to [`tests/protocol/manifest.json`](tests/protocol/manifest.json) and asserted every run, because tool descriptions are the prompt that steers the calling model: a wording change alters behaviour with no logic change, and the snapshot turns that into a visible diff.
+
+## One workflow, end to end
 
 ```
-memory://projects                        every project namespace
-memory://memories/{memory_id}            one memory at its current revision
-memory://memories/{memory_id}/history    full record, including retired memories
+1. Claude Desktop remembers: "The job queue runs on Redis."          [session ends]
+2. Cursor, a separate process sharing nothing but the database,
+   searches "queue" — finds it, with author_client recorded.
+3. Months later, Cursor remembers the replacement, superseding #1
+   in the same transaction.
+4. Search for "redis" now returns only the current answer, even
+   though #1 still contains that exact word.
+5. memory_history on #1 shows it as SUPERSEDED, not gone.
 ```
 
-The tool manifest — names, titles, descriptions, schemas — is snapshotted to
-[`tests/protocol/manifest.json`](tests/protocol/manifest.json) and asserted on every run. Tool
-descriptions are the prompt that steers the model, so a wording change alters behaviour with no
-logic change; the snapshot makes that show up in review as a diff.
+A runnable version of this is in [`demo.py`](demo.py) — it drives the real stdio transport and prints the actual tool responses.
 
-Supersession is deliberately not an eighth tool: retiring a fact and asserting its replacement are
-one atomic act, so `memory_remember` takes a `supersedes` argument.
+## Quick start
 
-## Milestone status
+```bash
+docker compose up -d --wait        # PostgreSQL 16 + pgvector
+pip install -e ".[dev]"
+alembic upgrade head
+pytest -v                          # 369 tests against the real database
+python demo.py                     # watch the workflow above run for real
+```
+
+Connecting a real client (Claude Desktop, Cursor) is covered in [`docs/clients.md`](docs/clients.md).
+
+## Repository structure
+
+```
+src/memhub/
+  domain/          pure types, policy, validation, normalisation — no I/O
+  services/        transactions, invariants, policy — no MCP awareness
+  persistence/     ORM models, repositories (every method requires a project scope)
+  retrieval/       filters.py, semantic.py, fusion.py — the stage-0 filter, written once
+  embeddings/      the port, a local model, and a deterministic fake for CI
+  mcp/             thin handlers, schemas, error mapping, stdio entry point
+  cli/             operator commands (purge, gc, status) — deliberately not over MCP
+  observability/   JSON logs to stderr; in-process metrics registry
+migrations/        async Alembic
+tests/             unit, integration, concurrency, failure, perf, protocol, eval
+docs/architecture.md   the full design, including what was deliberately not built
+docs/failure-modes.md  every failure the design claims to handle, mapped to its test
+```
+
+## Key design decisions
+
+**PostgreSQL as the only source of truth, including as a job queue.** Embedding generation is enqueued via `FOR UPDATE SKIP LOCKED` in the same transaction as the write it's for — both exist or neither does. No Redis, no Kafka: the durability and transactional guarantees a job queue needs were already sitting in the database being written to anyway.
+
+**Hybrid FTS + pgvector over a separate vector database.** Both retrieval paths run inside the same transaction boundary as the stage-0 filter, so "superseded memories are excluded" is one guarantee instead of two systems that have to agree.
+
+**Optimistic concurrency (compare-and-set) over pessimistic locking.** A conflicting writer gets an immediate, informative refusal with the winning revision attached, instead of blocking behind a lock or receiving a generic serialization failure.
+
+**Reciprocal Rank Fusion over score blending.** Lexical and vector scores live on incompatible, unbounded scales; combining rank positions sidesteps needing a shared scale at all.
+
+**Structural exclusion over ranking-based suppression.** A retired memory is removed from the *candidate set* before any ranking runs, so no scoring function — today's or a future one — can accidentally resurrect it.
+
+**Immutable revisions and append-only history.** Nothing is ever overwritten; a mistaken decision is recorded as superseded, not erased, because the audit trail is part of the product.
+
+## Tech stack
+
+**Language:** Python 3.12
+**Protocol:** MCP (`mcp` SDK v2), stdio transport
+**Persistence:** PostgreSQL 16, SQLAlchemy 2.x (async), asyncpg, Alembic
+**Retrieval:** PostgreSQL full-text search, pgvector (HNSW), `BAAI/bge-small-en-v1.5` via `fastembed`
+**Testing:** pytest, pytest-asyncio, real PostgreSQL throughout — no mocked database
+**Infrastructure:** Docker Compose
+
+## Project status and limitations
 
 | # | Milestone | State |
 |---|---|---|
@@ -193,343 +303,16 @@ one atomic act, so `memory_remember` takes a `supersedes` argument.
 | 8 | Context builder under a token budget | done |
 | 9 | Failure injection, retention, operator CLI, scaling benchmarks | done |
 
-### Concurrency
+**Not built:** an OTLP/Prometheus metrics exporter (metrics are collected in-process only — nothing scrapes or receives them yet), MCP resource subscriptions, and a shared-process Streamable HTTP transport for scenarios where stdio's one-process-per-client model doesn't fit.
 
-Each MCP client runs its own server process. They share no memory, so PostgreSQL is the only thing
-that can adjudicate a conflicting write. `memory_revise` performs a single-statement compare-and-set
-at `READ COMMITTED`:
+## Recommended engineering improvements
 
-```sql
-UPDATE memories SET current_revision_no = current_revision_no + 1
- WHERE id = :id AND project_id = :pid AND current_revision_no = :expected AND status = 'ACTIVE'
-```
+Honest gaps, not disguised as finished work:
 
-Zero rows means another writer got there first. The correctness argument is `EvalPlanQual`: when the
-losing transaction unblocks, PostgreSQL walks to the newest committed row version and re-evaluates
-this `WHERE` against it, so the read and the write are the same statement and there is no window to
-lose. `READ COMMITTED` is chosen *for* these semantics — `SERIALIZABLE` would raise `40001` and turn
-49 clean refusals into 49 retries.
-
-`tests/concurrency/` proves it: 50 writers aligned on a barrier, exactly 1 success and 49 conflicts,
-then the invariant suite. The fixture asserts the pool can supply 50 distinct backends first,
-because a 50-way test against a 10-connection pool measures five sequential waves and passes for the
-wrong reason. Removing the version predicate from the SQL makes those tests fail — verified.
-
-### Idempotency is not deduplication
-
-Idempotency is *one* client retrying *the same request*, keyed on a caller-supplied
-`client_request_id`; the retry replays the original response. Deduplication is *two* clients
-asserting *the same fact*, keyed on a content hash. The two are compared directly below.
-
-The claim is `INSERT ... ON CONFLICT DO NOTHING` — "check then insert" races. If another transaction
-holds the key uncommitted, `SELECT ... FOR SHARE` blocks until it resolves: a row means it committed
-and its response is replayed, no row means it rolled back and the key is free. A key reused with a
-*different* payload is refused rather than silently answering a question the caller never asked.
-
-Note that `memory_revise` does not *need* a key for correctness — the compare-and-set already makes
-a duplicate write impossible. The key is there so a retry after a dropped connection replays cleanly
-instead of reporting a conflict against yourself.
-
-### Stale-memory suppression
-
-This is the problem the project exists to solve. Suppose a project once used Redis as its queue and
-now uses PostgreSQL. Both statements were true when written; only one is true now. A retrieval-only
-system returns both and lets similarity decide, and similarity has no opinion about which is
-current, so the stale phrasing often wins precisely because it matches the query *better*.
-
-Recording the replacement with `supersedes` retires the old fact in the same transaction. It leaves
-retrieval immediately and stays fully readable through `memory_history`, with a link to what
-replaced it and who wrote it.
-
-The assertion that matters in `tests/integration/test_stale_memory.py` is not "the right answer
-ranks first" — it is **"the wrong answer is absent at every limit"**, checked across limits 1 to 100
-and several queries including `redis` itself. Ranking can bury a stale fact; only structure can
-exclude it. Removing the status condition from the stage-0 filter makes five of those tests fail —
-verified by mutation.
-
-### Deduplication is not idempotency
-
-| | Idempotency | Deduplication |
-|---|---|---|
-| Trigger | one client retries the same request | two clients assert the same fact |
-| Key | caller-supplied `client_request_id` | normalised content hash |
-| Answer | replay the original response | return the existing memory, record corroboration |
-
-A deduplicated write is evidence, not a nuisance: when Cursor states what Claude Desktop already
-stored, that second independent assertion is recorded as an attestation, and
-`COUNT(DISTINCT client_name)` becomes a ranking prior later. Attestations are counted per client,
-so one client retrying in a loop cannot manufacture corroboration.
-
-The dedup key lives in its own table rather than as a partial unique index, because the rule spans
-two tables — `is_current` on the revision, `status` on the memory — and no index can. Retirement
-releases the key, so a sentence can be legitimately re-asserted if a decision is reversed.
-
-### Retrieval quality is measured, not asserted
-
-200-memory corpus, 34 queries with graded relevance judgments written **before** anything was
-measured. Full results in [`docs/eval/results.md`](docs/eval/results.md); the numbers are gated
-against a committed baseline, so a regression fails the build rather than going unnoticed.
-
-| Strategy | nDCG@10 | Recall@10 | Precision@10 | Stale inclusion |
-|---|---|---|---|---|
-| full-text, all terms required | 0.478 | 0.468 | 0.484 | **0.000** |
-| full-text, any-term fallback | 0.802 | 0.817 | 0.691 | **0.000** |
-
-The harness immediately found a real defect. PostgreSQL joins bare query terms with AND, so
-"connection pool size" demands all three lexemes and misses a memory saying "connection pooling is
-bounded at 10" — questions as ordinary as "migration rules" returned *nothing*. A query that finds
-nothing now retries with any-term matching, which is where the jump came from. Precision holds
-because the widening only happens when the alternative is an empty result.
-
-**Stale inclusion stayed at exactly 0.000 through both.** That is the useful part: loosening the
-match did not loosen the correctness guarantee, because suppression is structural rather than a
-ranking effect. Several queries are built to punish a similarity-only system — `q02` asks for
-"redis" when the *retired* memory is about Redis and the current one mentions it only to say it was
-removed.
-
-Three queries still score zero, and all three are vocabulary gaps rather than bugs: `jwt` does not
-match `JWTs` (Snowball does not stem acronym plurals), "deadlock prevention" misses a memory that
-describes deadlock prevention without using the word, and "worked on right now" misses "Currently
-implementing". That is the concrete target for semantic retrieval — measured first, so the claim
-that it helps will be a number.
-
-### Hybrid retrieval
-
-Full-text and pgvector run over the same stage-0 filter and are fused by **Reciprocal Rank Fusion**
-— position, not score. `ts_rank_cd` is unbounded and corpus-dependent; cosine distance is in [0, 2].
-Adding them is meaningless, and normalising per query is worse: it scales a mediocre best match to
-1.0 exactly like a perfect one. RRF also degrades cleanly — if the outbox is behind, those documents
-simply do not appear in that ranking and contribute nothing.
-
-| Strategy | nDCG@10 | Recall@10 | Precision@10 | Stale |
-|---|---|---|---|---|
-| full text, all terms required | 0.478 | 0.468 | 0.484 | **0.000** |
-| full text, any-term fallback | 0.803 | 0.817 | 0.691 | **0.000** |
-| hybrid, RRF, distance ≤ 0.35 | **0.853** | **0.828** | 0.671 | **0.000** |
-
-The `jwt` query went from 0.000 to a perfect 1.000 — the stemmer never matched `JWTs`, whereas
-semantic similarity does. `deadlock prevention` is still 0.000: the memory describes deadlock
-prevention without ever using the word, and 384 dimensions of a small model do not bridge that.
-
-**The threshold is the part worth reading about.** Without one, hybrid scored nDCG 0.881 — and
-precision collapsed to **0.113**, with every unanswerable query returning ten results. Approximate
-nearest neighbour search returns the *k* closest vectors whether or not anything is close. 0.35 was
-chosen by sweeping against the corpus; the full table and what it costs are in
-[`docs/eval/threshold-sweep.md`](docs/eval/threshold-sweep.md). Reporting the 0.881 and stopping
-would have been true and badly misleading.
-
-### Embedding is asynchronous, by a transactional outbox
-
-Generating a vector inline would hold the `memories` row lock across a slow, fallible call — so one
-slow inference blocks every other writer, and a model being down becomes a *write* outage. Enqueuing
-after the transaction is the classic dual-write bug: crash between the commit and the enqueue, and the
-memory exists forever with no vector and nothing to notice its absence.
-
-So the job row is inserted **in the same transaction as the revision** — both exist or neither does.
-A worker claims batches with `FOR UPDATE SKIP LOCKED`, which is what lets a worker in each client's
-server process drain one queue without contending. A test asserts that four concurrent workers
-process exactly 40 jobs between them.
-
-The result is eventual consistency with an **explicit, queryable** pending state. Every search
-response carries `semantic_coverage`, so a caller can tell "the semantic half saw everything" from
-"it saw 60%". Failures back off exponentially and end as `DEAD` with the reason recorded — never a
-silent hole in the index.
-
-This project uses PostgreSQL as a durable job queue, which is the architectural decision used as the
-running example throughout its own documentation, and the reason Redis is not a dependency.
-
-### Running it with semantic search
-
-```bash
-pip install -e ".[local-embeddings]"
-```
-
-Then set `MEMHUB_EMBEDDING_ADAPTER=local`. Defaults to `none`, so a fresh install works with no model
-download and search is full-text only — a server that downloads a model on first use is a server
-that fails to start without a network, for a feature meant to be an enhancement.
-
-CI uses a deterministic hash embedder that carries **no semantic signal**. It exists to exercise the
-outbox, the vector column, fusion and coverage reporting hermetically. It cannot measure quality, and
-the harness does not let it try: the numbers above come from `BAAI/bge-small-en-v1.5` run locally.
-
-### Context budgeting
-
-`memory_context` answers a different question from search. Search asks *what matches this query*;
-this asks *given this much room, what is worth knowing*. Those come apart — the ten most relevant
-memories might be five restatements of one decision plus five details of a task that finished last
-month, and a brief made of those is worse than a shorter one covering four different things.
-
-So it is built as a constrained selection problem: per-type quotas with redistribution, MMR
-diversity, greedy knapsack fill by score-per-token, and a total ordering so identical inputs give
-byte-identical output. Quotas are what stop fifty chatty facts crowding out the two constraints that
-say *never do X*.
-
-**The budget is a guarantee, and the estimator is the interesting part.** The server does not know
-the client's model, so any token count is an approximation — and the two ways to be wrong are not
-comparable. Over-running corrupts the caller's context window; under-filling wastes a little of it.
-The estimator is therefore biased to over-count, and the contract is stated plainly: *never exceed,
-may under-fill by ~10%*.
-
-That bias had to be measured, not assumed. The first divisor (3.6 chars/token) looked safely below
-the ~4.0 quoted for English prose and **under-estimated 2 of 33 real memories** — technical writing
-full of identifiers like `FOR UPDATE SKIP LOCKED` tokenises at 3.25 chars/token. Corrected to 3.2,
-zero samples under-estimate and the worst case is 4.8% over. Full write-up in
-[`docs/eval/tokens.md`](docs/eval/tokens.md).
-
-The response reports what was spent, what was considered, and **why each memory was dropped** —
-`too_similar`, `no_budget_left`, `too_large_alone`. A caller who asked for 2000 tokens and got 400
-needs to distinguish "the project has little to say" from "thirty memories did not fit"; those call
-for opposite responses.
-
-Stale suppression holds here too, tested at **every** budget from 100 to 8000 and every query, with
-the retired memory at maximum importance and its replacement at minimum. It holds for the same
-reason it held through full-text and through vectors: selection can only choose from the candidate
-set, and the stage-0 filter has already removed the retired memory from that set.
-
-### Failure is a specification, not an afterthought
-
-The architecture lists eighteen ways this system can fail and what it does about each.
-[`docs/failure-modes.md`](docs/failure-modes.md) maps every one of those rows to the test that holds
-it up — and says plainly which three are argued rather than tested, and why a test there would be
-testing PostgreSQL rather than this system.
-
-Writing that document exposed two claims the prose was still making that had quietly stopped being
-true. Three of the error codes it promised did not exist anywhere in the code, so a database outage
-reached the model as an opaque internal error, which a model reads as *this tool is broken* before
-it stops calling the tool altogether. And the
-documented degradation path fired only when the embedder failed, not when a query was cancelled,
-which is the likelier cause. Both are fixed.
-
-Driver failures now arrive as codes that say what to do next, and the distinction between them is
-the point:
-
-| Code | Safe to retry | Because |
-|---|---|---|
-| `BACKEND_UNAVAILABLE` | yes | the connection never opened; nothing ran |
-| `BACKEND_BUSY` | yes | the pool timed out before a statement was sent |
-| `UNKNOWN_OUTCOME` | **no** | the connection died mid-flight; the write may have committed |
-| `DEADLINE_EXCEEDED` | no | the query was too slow; the server is healthy |
-
-`UNKNOWN_OUTCOME` is the only genuinely ambiguous failure here: the transaction either committed
-just before the connection dropped or it did not, and the acknowledgement that would have said which
-is exactly what was lost. So it does not claim the write failed — it names the two ways out, replay
-the idempotency key or re-read. Retrying blindly is how duplicate writes happen, and that ordering
-is mutation-tested.
-
-### Scaling: cost grows with the answer, not the corpus
-
-One measurement says nothing about shape, so the benchmark takes three points:
-
-```
-  1,000 memories  matched=5      server=  0.36ms  client=  5.34ms
- 10,000 memories  matched=50     server=  0.53ms  client= 11.00ms
-100,000 memories  matched=500    server=  0.67ms  client= 22.80ms
-```
-
-**The corpus grew 100x; query time grew 1.9x.** That is the property that matters for a system meant
-to accumulate knowledge for years.
-
-Two earlier versions of this benchmark asserted that the GIN index appears in the query plan, and
-both were wrong for the same reason: PostgreSQL kept finding cheaper ways to answer than the one the
-test expected. At 100,000 rows it still chooses a sequential scan — and it is right to, because with
-`LIMIT 10` the scan stops as soon as it has ten matches, long before index access plus heap fetches
-would have paid for themselves. The plan is now recorded in
-[`docs/perf/scaling_plan.txt`](docs/perf/scaling_plan.txt) rather than asserted on. An index exists
-to make cost track the answer rather than the table; that property holds regardless of which access
-path the planner picks to deliver it.
-
-### Destroying data is not a tool
-
-`memory_forget` is a soft delete, which is the right default and the wrong operation for the one
-case that genuinely needs destruction: a credential recorded by mistake. That case gets a separate,
-human-invoked, audited path.
-
-```bash
-memhub-admin purge --project my-project --memory <uuid> --yes
-```
-
-It is deliberately not reachable over MCP. A model that misreads a request and calls `memory_forget`
-costs a tombstone that can be undone; the same mistake against `purge` costs the content. Without
-`--yes` it prints what it *would* destroy and stops.
-
-Purge clears every table that holds a copy or a derivative of the content — embeddings, dedup keys,
-attestations, revisions — because a partial erasure of a leaked credential is not an erasure. The
-audit row survives with its detail redacted, which is why `audit_events` has no foreign key to
-`memories`: a `CASCADE` would delete the evidence along with its subject.
-
-Retention (`memhub-admin gc`) never removes a memory. It collects spent idempotency keys and
-long-dead embedding jobs, and nothing else. Retention that silently deleted a project's knowledge
-would be indistinguishable from data loss.
-
-### Refusing to start against the wrong schema
-
-Checked once at startup, and it refuses in **both** directions. A database that is behind fails
-loudly on the first missing column — annoying, but obvious. A database that is *ahead*, migrated by
-a colleague or a deploy that already rolled forward, mostly works, right up until this process
-writes a row that the newer constraints were added to prevent. The quiet direction is the dangerous
-one, and it is the one nobody guards against.
-
-### What is deliberately not built yet
-
-### Retrieval
-
-Full-text over a `tsvector` generated column with a partial GIN index, ranked by `ts_rank_cd` scaled
-by three priors: importance, a **type-dependent recency half-life** (a TASK is worthless after a
-month; a DECISION from a year ago may be the most important thing in the corpus), and a small type
-weight. Priors are multiplicative, so a memory that does not match the query scores zero however
-important it is.
-
-The weights are **untuned and labelled as such**. Milestone 6 builds the evaluation harness; tuning
-them now would mean fitting numbers to intuition and then building the ruler that agrees.
-
-Two findings worth keeping:
-
-- `is_current IS TRUE` makes the partial index **unusable** — PostgreSQL cannot prove it implies
-  `WHERE is_current`, because `IS TRUE` is null-safe and therefore a different expression. The bare
-  column works. Guarded by a test on the compiled SQL, since neither a latency test nor a plan
-  assertion catches it reliably.
-- The English stemmer maps `queue`/`queues`/`queueing` to one lexeme but `queued` to another, so
-  that query misses. Pinned as a failing case rather than described in prose — it is the honest
-  argument for semantic retrieval, and Milestone 6 will measure what it costs.
-
-Measured at 10k memories (`docs/perf/`): **1.8–5.5 ms** inside PostgreSQL. Client-observed p50 is
-7–17 ms; the gap is Docker Desktop port forwarding, not query cost, which is why the benchmark
-asserts both separately rather than hiding the overhead in one number.
-
-Metrics are an in-process registry that enforces the label-cardinality rule (`memory_id` and
-`project_id` are refused as labels). There is no OTLP exporter: the server is a short-lived
-subprocess, so pull-based scraping cannot find it and push needs a collector. That is Milestone 9.
-
-## Layout
-
-```
-src/memhub/
-  domain/          pure types, policy, validation, normalisation — no I/O
-  services/        transactions, invariants, policy — no MCP awareness
-  persistence/     ORM models, repositories (every method requires a project scope)
-  retrieval/       filters.py — the stage-0 filter, written once
-  embeddings/      the port, a local model, and a deterministic fake for CI
-  mcp/             thin handlers, schemas, error mapping, stdio entry point
-  cli/             operator commands, deliberately not reachable over MCP
-  observability/   JSON logs to stderr (stdout is the JSON-RPC channel)
-migrations/        async Alembic
-tests/             unit, integration, protocol, concurrency, failure, perf
-docs/architecture.md   the design, including what was deliberately not built
-docs/failure-modes.md  every failure the design claims to handle, and its test
-```
-
-## Invariants enforced by the database
-
-Nine of the fourteen invariants in the architecture document are schema-level, so they survive a bug
-in the service layer. `tests/integration/test_invariants.py` proves each one by bypassing the
-service layer and attempting the forbidden write directly:
-
-- at most one current revision per memory (partial unique index)
-- revision numbers unique per memory (composite primary key)
-- supersession cannot cross a project boundary (composite foreign key)
-- a memory cannot supersede itself
-- `SUPERSEDED` requires both a timestamp and a target
-- every `TASK` has an expiry
+- **No authentication or authorization layer.** Any process that can reach the configured `MEMHUB_DATABASE_URL` can read and write any project. Fine for the single-user local stdio deployment this targets; a real gap the moment a shared server serves multiple untrusted callers.
+- **No metrics exporter.** The in-process registry enforces label-cardinality discipline correctly, but nothing currently scrapes or receives it — there's no operational visibility outside the structured logs.
+- **stdio is single-tenant per client process.** A long-lived server handling many concurrent client connections needs the Streamable HTTP transport, which is a real design change (auth, per-caller authorization), not a flag flip.
+- **Retention is manual.** `memhub-admin gc` collects spent idempotency keys and dead embedding jobs, but nothing schedules it — it has to be invoked, by a human or an external cron, not by the system itself.
 
 ## License
 
