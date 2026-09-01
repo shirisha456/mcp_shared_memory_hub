@@ -9,19 +9,19 @@
 
 ---
 
-## The problem
+## Why this is hard
 
-Giving one AI assistant a memory isn't hard — it's just a text file the assistant reads. It gets hard the moment several different clients need to share that same memory:
+Giving one AI assistant a memory is easy — a text file it can read. Giving **several different clients** a memory they all share is a different problem, because now:
 
-- Two clients can try to update the same fact at the same time.
-- A decision can be reversed, and the reversal has to take effect everywhere, immediately.
-- The old decision still has to be auditable, so someone can see why it changed.
-- If both versions stay retrievable, a similarity search can return the wrong one — the retired wording often matches a query better than the current answer does.
-- Lexical and semantic search each catch things the other misses, so neither alone is enough.
-- Whatever gets retrieved has to fit inside a token budget, not just be ranked by relevance.
-- Every client has to reach all of this through the same protocol, not a one-off integration each.
+- two clients can try to update the same fact **at the same time**
+- a decision made last month can be **reversed**, and the reversal has to actually take effect everywhere
+- the old decision still needs to be **auditable** — someone will ask why it changed
+- if the old and new versions are both left retrievable, a similarity search can return the **wrong one**, because the retired phrasing often matches the query better than the current answer does
+- lexical and semantic search each miss things the other catches, so neither alone is enough
+- whatever gets retrieved has to fit inside a **token budget**, not just be sorted by relevance
+- every client has to reach all of this through the **same protocol**, not a bespoke integration each
 
-Storing a fact is easy. **Retiring one correctly — so it can never resurface, however it's searched for, while it still stays in the audit trail — is a concurrency and retrieval problem.** That's what this project actually solves.
+Storing a fact is a CRUD operation. Correctly *retiring* one — so it can never come back, however it's searched for, while still remaining in the audit trail — is a concurrency and retrieval problem. That is what this project is actually about.
 
 ## Architecture
 
