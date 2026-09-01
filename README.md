@@ -11,6 +11,8 @@
 
 ## Why this is hard
 
+Developers don't use just one AI coding tool. Someone explains a decision to Claude Desktop, then switches to Cursor for a different task — and Cursor has no idea what was just decided, because it never saw that conversation. Every tool starts from zero, every time.
+
 Giving one AI assistant a memory is easy — a text file it can read. Giving **several different clients** a memory they all share is a different problem, because now:
 
 - two clients can try to update the same fact **at the same time**
