@@ -145,8 +145,12 @@ async def collect_garbage(session: AsyncSession, *, batch: int = 1000) -> dict[s
     return {"idempotency_keys": keys, "dead_embedding_jobs": _affected(dead)}
 
 
-async def status(session: AsyncSession) -> dict[str, object]:
-    """A short operational summary, for answering "is anything stuck?"."""
+async def status(session: AsyncSession) -> dict[str, int]:
+    """A short operational summary, for answering "is anything stuck?".
+
+    Every column here is a ``count(*)``, so the return type is genuinely
+    ``dict[str, int]`` - not loosened to ``object`` to sidestep typing it properly.
+    """
     row = (
         await session.execute(
             text(

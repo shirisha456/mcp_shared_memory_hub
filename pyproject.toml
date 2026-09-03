@@ -106,6 +106,14 @@ ignore_errors = true
 module = ["asyncpg.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# fastembed is an optional extra (`pip install -e ".[local-embeddings]"`), imported
+# lazily inside a try/except specifically so the server starts without it. A plain
+# `mypy` run in an environment that never installed the extra has no stub to find;
+# that is expected, not a type error in this code.
+module = ["fastembed.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------
